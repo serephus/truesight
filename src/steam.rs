@@ -1,0 +1,322 @@
+use crate::config::SteamConfig;
+use crate::model::Hero;
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{Client, StatusCode};
+use serde_json::Value;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
+
+const HISTORY_PATH: &str = "/IDOTA2Match_570/GetMatchHistoryBySequenceNum/v1/";
+const LATEST_PATH: &str = "/IDOTA2Match_570/GetMatchHistory/v1/";
+const HEROES_PATH: &str = "/IEconDOTA2_570/GetHeroes/v1/";
+
+#[derive(Clone)]
+pub struct SteamClient {
+    http: Client,
+    base_url: String,
+    keys: Arc<Mutex<KeyPool>>,
+}
+
+struct KeyPool {
+    keys: Vec<KeyState>,
+    cursor: usize,
+}
+
+struct KeyState {
+    key: String,
+    failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+impl SteamClient {
+    pub fn new(cfg: &SteamConfig) -> Result<Self> {
+        if cfg.keys.is_empty() {
+            bail!("SteamClient requires at least one API key");
+        }
+        let http = Client::builder()
+            .timeout(cfg.timeout)
+            .user_agent("truesight/0.1 (+https://github.com/serephus/truesight)")
+            .build()
+            .context("failed to build Steam HTTP client")?;
+        Ok(Self {
+            http,
+            base_url: cfg.base_url.clone(),
+            keys: Arc::new(Mutex::new(KeyPool {
+                keys: cfg
+                    .keys
+                    .iter()
+                    .map(|key| KeyState {
+                        key: key.clone(),
+                        failures: 0,
+                        cooldown_until: None,
+                    })
+                    .collect(),
+                cursor: 0,
+            })),
+        })
+    }
+
+    /// Fetch up to `matches_requested` full match objects starting at a sequence number.
+    pub async fn fetch_by_sequence(&self, start_seq: u64, batch_size: u32) -> Result<Vec<Value>> {
+        let params = vec![
+            ("start_at_match_seq_num", start_seq.to_string()),
+            ("matches_requested", batch_size.to_string()),
+        ];
+        let value = self.get_json(HISTORY_PATH, &params).await?;
+        let result = api_result(&value)?;
+        let matches = result
+            .get("matches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        debug!(start_seq, count = matches.len(), "fetched sequence batch");
+        Ok(matches)
+    }
+
+    /// Best-effort lookup of the newest public match sequence number.
+    pub async fn fetch_latest_sequence(&self) -> Result<u64> {
+        let mut last_error = None;
+        for game_mode in [Some("22"), None] {
+            let mut params = vec![("matches_requested", "1".to_owned())];
+            if let Some(game_mode) = game_mode {
+                params.push(("game_mode", game_mode.to_owned()));
+            }
+            match self.get_json(LATEST_PATH, &params).await {
+                Ok(value) => match api_result(&value) {
+                    Ok(result) => {
+                        let seq = result
+                            .get("matches")
+                            .and_then(Value::as_array)
+                            .and_then(|matches| matches.first())
+                            .and_then(|m| m.get("match_seq_num"))
+                            .and_then(Value::as_u64);
+                        if let Some(seq) = seq {
+                            return Ok(seq);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "Steam latest-sequence lookup failed");
+                        last_error = Some(error);
+                    }
+                },
+                Err(error) => {
+                    warn!(%error, "Steam latest-sequence request failed");
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("Steam did not return any public match; cannot determine startup sequence")
+        }))
+    }
+
+    pub async fn fetch_heroes(&self) -> Result<Vec<Hero>> {
+        let value = self
+            .get_json(HEROES_PATH, &[("language", "en".to_owned())])
+            .await?;
+        let result = api_result(&value)?;
+        let heroes = result
+            .get("heroes")
+            .and_then(Value::as_array)
+            .context("Steam hero response is missing result.heroes")?;
+        let mut parsed = Vec::with_capacity(heroes.len());
+        for hero in heroes {
+            if let Ok(hero) = Hero::from_value(hero) {
+                parsed.push(hero);
+            }
+        }
+        Ok(parsed)
+    }
+
+    async fn get_json(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let max_attempts = self.key_count().saturating_mul(2).max(2);
+        let mut last_error = None;
+
+        for attempt in 0..max_attempts {
+            let (index, key) = self.pick_key()?;
+            let mut query: Vec<(&str, String)> = params.to_vec();
+            query.push(("key", key));
+            query.push(("format", "json".to_owned()));
+
+            let response = self.http.get(&url).query(&query).send().await;
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let text = response
+                            .text()
+                            .await
+                            .context("failed to read Steam response body")?;
+                        match serde_json::from_str::<Value>(&text) {
+                            Ok(value) => {
+                                if let Some(error) = api_error(&value) {
+                                    self.mark_failure(index, Duration::from_secs(30));
+                                    last_error = Some(anyhow!("Steam API error: {error}"));
+                                } else {
+                                    self.mark_success(index);
+                                    return Ok(value);
+                                }
+                            }
+                            Err(error) => {
+                                self.mark_failure(index, Duration::from_secs(5));
+                                last_error = Some(anyhow!(
+                                    "Steam returned invalid JSON: {error}: {}",
+                                    truncate(&text, 300)
+                                ));
+                            }
+                        }
+                    } else {
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let cooldown = match status {
+                            StatusCode::TOO_MANY_REQUESTS => {
+                                Duration::from_secs(retry_after.unwrap_or(30).max(10))
+                            }
+                            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                                Duration::from_secs(3600)
+                            }
+                            _ => Duration::from_secs(10),
+                        };
+                        warn!(%status, attempt, "Steam request failed");
+                        self.mark_failure(index, cooldown);
+                        last_error = Some(anyhow!("Steam returned HTTP {status}"));
+                    }
+                }
+                Err(error) => {
+                    self.mark_failure(index, Duration::from_secs(5));
+                    last_error = Some(anyhow!("Steam request failed: {error}"));
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Steam request failed")))
+    }
+
+    fn key_count(&self) -> usize {
+        self.lock().keys.len()
+    }
+
+    fn pick_key(&self) -> Result<(usize, String)> {
+        let now = Instant::now();
+        let mut pool = self.lock();
+        let len = pool.keys.len();
+        for offset in 0..len {
+            let index = (pool.cursor + offset) % len;
+            let available = pool.keys[index]
+                .cooldown_until
+                .map(|until| until <= now)
+                .unwrap_or(true);
+            if available {
+                pool.cursor = (index + 1) % len;
+                return Ok((index, pool.keys[index].key.clone()));
+            }
+        }
+        let wait = pool
+            .keys
+            .iter()
+            .filter_map(|key| key.cooldown_until)
+            .min()
+            .map(|until| until.saturating_duration_since(now))
+            .unwrap_or(Duration::from_secs(5));
+        bail!("all Steam API keys are cooling down for {wait:?}")
+    }
+
+    fn mark_success(&self, index: usize) {
+        let mut pool = self.lock();
+        if let Some(key) = pool.keys.get_mut(index) {
+            key.failures = 0;
+            key.cooldown_until = None;
+        }
+    }
+
+    fn mark_failure(&self, index: usize, cooldown: Duration) {
+        let mut pool = self.lock();
+        if let Some(key) = pool.keys.get_mut(index) {
+            key.failures = key.failures.saturating_add(1);
+            let exponential = Duration::from_secs(2u64.saturating_pow(key.failures.min(6)));
+            key.cooldown_until = Some(Instant::now() + cooldown.max(exponential));
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeyPool> {
+        self.keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn api_result(value: &Value) -> Result<&Value> {
+    let result = value
+        .get("result")
+        .context("Steam response is missing result")?;
+    if let Some(error) = api_error(value) {
+        bail!("Steam API error: {error}");
+    }
+    if let Some(status) = result.get("status").and_then(Value::as_u64)
+        && status != 1
+    {
+        bail!("Steam API returned status {status}");
+    }
+    Ok(result)
+}
+
+fn api_error(value: &Value) -> Option<String> {
+    let result = value.get("result")?;
+    if let Some(error) = result
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(error.to_owned());
+    }
+    let failed = result
+        .get("status")
+        .and_then(Value::as_u64)
+        .map(|status| status != 1)
+        .unwrap_or(false);
+    if failed {
+        return result
+            .get("statusDetail")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    None
+}
+
+fn truncate(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detects_api_errors() {
+        let value = json!({"result": {"status": 0, "statusDetail": "invalid key"}});
+        assert_eq!(api_error(&value).as_deref(), Some("invalid key"));
+        assert!(api_result(&value).is_err());
+    }
+
+    #[test]
+    fn parses_successful_result() {
+        let value = json!({"result": {"status": 1, "matches": []}});
+        assert!(api_result(&value).unwrap().get("matches").is_some());
+    }
+}
