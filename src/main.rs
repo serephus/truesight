@@ -57,17 +57,22 @@ async fn main() -> Result<()> {
     let ct = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
+    if let Some(steam) = steam.clone() {
+        tasks.spawn(heroes::run(ch.clone(), steam.clone(), ct.clone()));
+    } else {
+        warn!("no Steam API keys; hero metadata will not be loaded");
+    }
+
     if cfg.collector.enabled {
         let steam = steam
             .clone()
             .context("collector is enabled but no Steam client could be built")?;
         tasks.spawn(collector::run(
             ch.clone(),
-            steam.clone(),
+            steam,
             cfg.collector.clone(),
             ct.clone(),
         ));
-        tasks.spawn(heroes::run(ch.clone(), steam, ct.clone()));
     } else {
         warn!("collector disabled; no new matches will be ingested");
     }

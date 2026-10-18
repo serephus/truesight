@@ -37,9 +37,10 @@ function num(value, digits = 0) {
   });
 }
 
-function heroIcon(icon, cls = "") {
-  if (!icon) return `<span class="hero-icon ${cls}"></span>`;
-  return `<img class="hero-icon ${cls}" loading="lazy" alt="" src="${CDN}/${encodeURIComponent(icon)}.png">`;
+function heroIcon(icon, cls = "", iconUrl = "") {
+  const url = iconUrl || (icon ? `${CDN}/${encodeURIComponent(icon)}.png` : "");
+  if (!url) return `<span class="hero-icon ${cls}"></span>`;
+  return `<img class="hero-icon ${cls}" loading="lazy" alt="" src="${url}">`;
 }
 
 function deltaHtml(delta) {
@@ -85,6 +86,9 @@ async function api(path) {
 async function loadHeroes() {
   const data = await api(`/api/heroes?period=${state.period}`);
   state.heroes = data.heroes || [];
+  if (state.heroes.length && state.heroes.every((hero) => !hero.name)) {
+    showError(new Error("Hero names/icons are not loaded yet; check Steam GetHeroes access."));
+  }
   renderMeta(data);
   renderLeaderboard();
   renderHeroPicker();
@@ -132,7 +136,7 @@ function renderLeaderboard() {
       <td class="num ${rankClass}">${rank}</td>
       <td>
         <div class="hero-cell">
-          ${heroIcon(hero.icon)}
+          ${heroIcon(hero.icon, "", hero.icon_url)}
           <div>
             <div class="hero-name">${esc(hero.localized_name || `#${hero.hero_id}`)}</div>
             <div class="hero-sub">${esc(hero.primary_attr || "")}${hero.roles?.length ? ` · ${esc(hero.roles.slice(0, 2).join(", "))}` : ""}</div>
@@ -161,7 +165,7 @@ function renderHeroPicker() {
   }
   el.heroPicker.innerHTML = heroes.map((hero) => `
     <button class="picker-item ${state.selectedHero === hero.hero_id ? "active" : ""}" data-hero="${hero.hero_id}">
-      ${heroIcon(hero.icon, "small")}
+      ${heroIcon(hero.icon, "small", hero.icon_url)}
       <span>${esc(hero.localized_name || `#${hero.hero_id}`)}</span>
       <span class="rating">${num(hero.rating)}</span>
     </button>`).join("");
@@ -191,7 +195,7 @@ function renderCounterPanel(detail) {
   const winRate = Number(hero.win_rate || 0) * 100;
   el.counterPanel.innerHTML = `
     <div class="counter-head">
-      ${heroIcon(hero.icon)}
+      ${heroIcon(hero.icon, "", hero.icon_url)}
       <div>
         <h2>${esc(hero.localized_name || `#${hero.hero_id}`)}</h2>
         <p>Rating <b>${num(hero.rating)}</b> ${deltaHtml(hero.delta)} · ${num(hero.games)} games · ${winRate.toFixed(1)}% wins</p>
@@ -207,7 +211,7 @@ function counterColumns(beats, losesTo) {
       <h3>${title}</h3>
       ${counters.length ? counters.map((counter) => `
         <div class="counter-row">
-          ${heroIcon(counter.icon, "small")}
+          ${heroIcon(counter.icon, "small", counter.icon_url)}
           <span class="name">${esc(counter.localized_name)}</span>
           <span class="games">${num(counter.games)}g</span>
           <span class="rate">${(Number(counter.win_rate) * 100).toFixed(1)}%</span>
@@ -235,7 +239,7 @@ function detailHtml(detail) {
   const winRate = Number(hero.win_rate || 0) * 100;
   return `
     <div class="detail-head">
-      ${heroIcon(hero.icon)}
+      ${heroIcon(hero.icon, "", hero.icon_url)}
       <div>
         <h2>${esc(hero.localized_name || `#${hero.hero_id}`)}</h2>
         <div class="sub">${esc(hero.attack_type || "")} ${hero.primary_attr ? `· ${esc(hero.primary_attr)}` : ""} ${hero.roles?.length ? `· ${esc(hero.roles.join(", "))}` : ""}</div>
@@ -303,7 +307,7 @@ function matchCard(match) {
   const team = (label, heroes, score, winner) => `
     <div class="team ${winner ? "winner" : ""}">
       <span class="team-label ${label}">${label === "radiant" ? "RAD" : "DIRE"}</span>
-      ${heroes.map((hero) => `<span title="${esc(hero.localized_name)}">${heroIcon(hero.icon, "small")}</span>`).join("")}
+      ${heroes.map((hero) => `<span title="${esc(hero.localized_name)}">${heroIcon(hero.icon, "small", hero.icon_url)}</span>`).join("")}
       <span class="score">${score}</span>
     </div>`;
   return `<article class="match-card">

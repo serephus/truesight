@@ -121,6 +121,7 @@ struct HealthResponse {
     last_seq: Option<u64>,
     latest_match_time: u32,
     matches_stored: u64,
+    heroes_loaded: u32,
     rankings: HashMap<String, u32>,
 }
 
@@ -161,6 +162,15 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         .map(|m| (m.period, m.computed_at))
         .collect();
 
+    let hero_count: Vec<HeroCount> = state
+        .ch
+        .query(&format!(
+            "SELECT uniqExact(hero_id) AS heroes FROM {}",
+            state.ch.table("heroes")
+        ))
+        .await
+        .map_err(ApiError::internal)?;
+
     Ok(Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -168,6 +178,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         last_seq,
         latest_match_time: row.latest,
         matches_stored: row.count,
+        heroes_loaded: hero_count.first().map(|h| h.heroes).unwrap_or(0),
         rankings,
     }))
 }
@@ -190,6 +201,11 @@ struct ModelTime {
     computed_at: u32,
 }
 
+#[derive(Deserialize)]
+struct HeroCount {
+    heroes: u32,
+}
+
 #[derive(Serialize)]
 struct HeroesResponse {
     period: &'static str,
@@ -208,6 +224,7 @@ struct HeroDto {
     name: String,
     localized_name: String,
     icon: String,
+    icon_url: String,
     primary_attr: String,
     attack_type: String,
     roles: Vec<String>,
@@ -233,39 +250,31 @@ struct RatingRow {
     prev_rating: f64,
     delta: f64,
     rank: u16,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    localized_name: String,
-    #[serde(default)]
-    icon: String,
-    #[serde(default)]
-    primary_attr: String,
-    #[serde(default)]
-    attack_type: String,
-    #[serde(default)]
-    roles: Vec<String>,
 }
 
-impl From<RatingRow> for HeroDto {
-    fn from(row: RatingRow) -> Self {
-        Self {
-            hero_id: row.hero_id,
-            name: row.name,
-            localized_name: row.localized_name,
-            icon: row.icon,
-            primary_attr: row.primary_attr,
-            attack_type: row.attack_type,
-            roles: row.roles,
-            rating: row.rating,
-            rating_se: row.rating_se,
-            games: row.games,
-            wins: row.wins,
-            win_rate: row.win_rate,
-            prev_rating: row.prev_rating,
-            delta: row.delta,
-            rank: row.rank,
-        }
+fn hero_dto(row: RatingRow, meta: Option<&HeroMeta>) -> HeroDto {
+    let icon = meta.map(|m| m.icon.clone()).unwrap_or_default();
+    let localized_name = meta
+        .map(|m| m.localized_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("#{}", row.hero_id));
+    HeroDto {
+        hero_id: row.hero_id,
+        name: meta.map(|m| m.name.clone()).unwrap_or_default(),
+        localized_name,
+        icon_url: icon_url(&icon),
+        icon,
+        primary_attr: meta.map(|m| m.primary_attr.clone()).unwrap_or_default(),
+        attack_type: meta.map(|m| m.attack_type.clone()).unwrap_or_default(),
+        roles: meta.map(|m| m.roles.clone()).unwrap_or_default(),
+        rating: row.rating,
+        rating_se: row.rating_se,
+        games: row.games,
+        wins: row.wins,
+        win_rate: row.win_rate,
+        prev_rating: row.prev_rating,
+        delta: row.delta,
+        rank: row.rank,
     }
 }
 
@@ -295,7 +304,19 @@ async fn heroes(
         .map(|r| r.computed_at)
         .or_else(|| model.as_ref().map(|m| m.computed_at))
         .unwrap_or(0);
-    let heroes = rows.into_iter().map(HeroDto::from).collect();
+    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|meta| (meta.hero_id, meta))
+        .collect();
+    let heroes = rows
+        .into_iter()
+        .map(|row| {
+            let hero_id = row.hero_id;
+            hero_dto(row, meta.get(&hero_id))
+        })
+        .collect();
     Ok(Json(HeroesResponse {
         period: period.as_str(),
         computed_at,
@@ -341,6 +362,7 @@ struct Counter {
     hero_id: u16,
     localized_name: String,
     icon: String,
+    icon_url: String,
     games: u64,
     wins: u64,
     win_rate: f64,
@@ -354,11 +376,21 @@ struct PairRow {
     lo_wins: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct HeroMeta {
     hero_id: u16,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
     localized_name: String,
+    #[serde(default)]
     icon: String,
+    #[serde(default)]
+    primary_attr: String,
+    #[serde(default)]
+    attack_type: String,
+    #[serde(default)]
+    roles: Vec<String>,
 }
 
 async fn hero_detail(
@@ -370,12 +402,18 @@ async fn hero_detail(
     let rows = latest_ratings(&state.ch, period, Some(hero_id))
         .await
         .map_err(ApiError::internal)?;
+    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|meta| (meta.hero_id, meta))
+        .collect();
     let hero = rows
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::not_found("hero has no rating for this period"))?;
     let computed_at = hero.computed_at;
-    let hero_dto = HeroDto::from(hero);
+    let hero_dto = hero_dto(hero, meta.get(&hero_id));
 
     let history: Vec<HistoryPoint> = state
         .ch
@@ -404,12 +442,6 @@ async fn hero_detail(
 
     let min_games = query.min_games.unwrap_or(20).max(1);
     let pairs = pair_rows(&state, period).await?;
-    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
-        .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(|meta| (meta.hero_id, meta))
-        .collect();
     let mut counters = Vec::new();
     for pair in pairs.iter().filter(|p| p.games >= min_games) {
         let other = if pair.hero_lo == hero_id {
@@ -425,13 +457,15 @@ async fn hero_detail(
             pair.games.saturating_sub(pair.lo_wins)
         };
         let meta = meta.get(&other);
+        let icon = meta.map(|m| m.icon.clone()).unwrap_or_default();
         counters.push(Counter {
             hero_id: other,
             localized_name: meta
                 .map(|m| m.localized_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| format!("#{other}")),
-            icon: meta.map(|m| m.icon.clone()).unwrap_or_default(),
+            icon_url: icon_url(&icon),
+            icon,
             games: pair.games,
             wins,
             win_rate: (wins as f64 + 1.0) / (pair.games as f64 + 2.0),
@@ -477,31 +511,17 @@ async fn latest_ratings(
     hero_id: Option<u16>,
 ) -> Result<Vec<RatingRow>> {
     let filter = hero_id
-        .map(|id| format!(" AND r.hero_id = {id}"))
+        .map(|id| format!(" AND hero_id = {id}"))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT r.computed_at, r.hero_id, r.rating, r.rating_se, r.games, r.wins,
-                r.win_rate, r.prev_rating, r.delta, r.rank,
-                h.name AS name, h.localized_name AS localized_name, h.icon AS icon,
-                h.primary_attr AS primary_attr, h.attack_type AS attack_type,
-                h.roles AS roles
-         FROM {} AS r
-         LEFT JOIN (
-             SELECT hero_id,
-                    argMax(name, updated_at) AS name,
-                    argMax(localized_name, updated_at) AS localized_name,
-                    argMax(icon, updated_at) AS icon,
-                    argMax(primary_attr, updated_at) AS primary_attr,
-                    argMax(attack_type, updated_at) AS attack_type,
-                    argMax(roles, updated_at) AS roles
-             FROM {} GROUP BY hero_id
-         ) AS h ON h.hero_id = r.hero_id
-         WHERE r.period = {} AND r.computed_at = (
+        "SELECT computed_at, hero_id, rating, rating_se, games, wins,
+                win_rate, prev_rating, delta, rank
+         FROM {}
+         WHERE period = {} AND computed_at = (
              SELECT max(computed_at) FROM {} WHERE period = {}
          ){filter}
-         ORDER BY r.rank ASC",
+         ORDER BY rank ASC",
         ch.table("hero_ratings"),
-        ch.table("heroes"),
         quote_string(period.as_str()),
         ch.table("hero_ratings"),
         quote_string(period.as_str())
@@ -598,12 +618,20 @@ async fn pair_rows(state: &AppState, period: Period) -> Result<Vec<PairRow>, Api
     Ok(rows)
 }
 
+fn icon_url(icon: &str) -> String {
+    if icon.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/{icon}.png"
+        )
+    }
+}
+
 async fn hero_meta(ch: &ClickHouse) -> Result<Vec<HeroMeta>> {
     ch.query(&format!(
-        "SELECT hero_id,
-                argMax(localized_name, updated_at) AS localized_name,
-                argMax(icon, updated_at) AS icon
-         FROM {} GROUP BY hero_id",
+        "SELECT hero_id, name, localized_name, icon, primary_attr, attack_type, roles
+         FROM {} FINAL",
         ch.table("heroes")
     ))
     .await
@@ -632,6 +660,7 @@ struct MatchHero {
     hero_id: u16,
     localized_name: String,
     icon: String,
+    icon_url: String,
 }
 
 #[derive(Deserialize)]
@@ -671,13 +700,15 @@ async fn recent_matches(
         .collect();
     let to_hero = |id: u16| {
         let meta = meta.get(&id);
+        let icon = meta.map(|m| m.icon.clone()).unwrap_or_default();
         MatchHero {
             hero_id: id,
             localized_name: meta
                 .map(|m| m.localized_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| format!("#{id}")),
-            icon: meta.map(|m| m.icon.clone()).unwrap_or_default(),
+            icon_url: icon_url(&icon),
+            icon,
         }
     };
     let matches = rows
