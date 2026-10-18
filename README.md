@@ -168,7 +168,10 @@ systemd credentials, and applies systemd hardening. The ClickHouse data lives in
 | `GET /api/matches?limit=30` | Recent stored matches |
 
 The frontend is embedded in the binary (`assets/`), so no Node build step or
-static file deployment is required.
+static file deployment is required. Hero objects include `localized_name`,
+`icon`, `icon_url`, `primary_attr`, `attack_type`, and `roles`, loaded from
+Steam's `IEconDOTA2_570/GetHeroes` endpoint. Hero metadata is refreshed even
+when the match collector is disabled, as long as Steam keys are configured.
 
 ## ClickHouse tables
 

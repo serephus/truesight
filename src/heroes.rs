@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_AGE: u32 = 24 * 3600;
 
 #[derive(Deserialize)]
