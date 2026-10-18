@@ -1,6 +1,7 @@
 mod ch;
 mod collector;
 mod config;
+mod hero_data;
 mod heroes;
 mod model;
 mod period;
@@ -47,6 +48,9 @@ async fn main() -> Result<()> {
         cfg.clickhouse.timeout,
     )?;
     migrate_with_retry(&ch, cfg.raw_retention_days).await?;
+    if let Err(error) = heroes::seed_fallback(&ch).await {
+        warn!(%error, "failed to seed hardcoded hero metadata; web will use the built-in fallback");
+    }
 
     let steam = if cfg.steam.keys.is_empty() {
         None
