@@ -1,4 +1,5 @@
 use crate::ch::{ClickHouse, quote_string};
+use crate::hero_data;
 use crate::period::Period;
 use anyhow::Result;
 use axum::{
@@ -17,7 +18,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
@@ -162,14 +163,19 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         .map(|m| (m.period, m.computed_at))
         .collect();
 
-    let hero_count: Vec<HeroCount> = state
+    let db_heroes = state
         .ch
-        .query(&format!(
+        .query::<HeroCount>(&format!(
             "SELECT uniqExact(hero_id) AS heroes FROM {}",
             state.ch.table("heroes")
         ))
         .await
-        .map_err(ApiError::internal)?;
+        .map(|rows| rows.first().map(|row| row.heroes).unwrap_or(0))
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to count ClickHouse hero metadata; using hardcoded fallback");
+            0
+        });
+    let heroes_loaded = db_heroes.max(hero_data::HEROES.len() as u32);
 
     Ok(Json(HealthResponse {
         status: "ok",
@@ -178,7 +184,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         last_seq,
         latest_match_time: row.latest,
         matches_stored: row.count,
-        heroes_loaded: hero_count.first().map(|h| h.heroes).unwrap_or(0),
+        heroes_loaded,
         rankings,
     }))
 }
@@ -304,12 +310,7 @@ async fn heroes(
         .map(|r| r.computed_at)
         .or_else(|| model.as_ref().map(|m| m.computed_at))
         .unwrap_or(0);
-    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
-        .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(|meta| (meta.hero_id, meta))
-        .collect();
+    let meta = hero_meta(&state.ch).await;
     let heroes = rows
         .into_iter()
         .map(|row| {
@@ -402,12 +403,7 @@ async fn hero_detail(
     let rows = latest_ratings(&state.ch, period, Some(hero_id))
         .await
         .map_err(ApiError::internal)?;
-    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
-        .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(|meta| (meta.hero_id, meta))
-        .collect();
+    let meta = hero_meta(&state.ch).await;
     let hero = rows
         .into_iter()
         .next()
@@ -628,13 +624,71 @@ fn icon_url(icon: &str) -> String {
     }
 }
 
-async fn hero_meta(ch: &ClickHouse) -> Result<Vec<HeroMeta>> {
-    ch.query(&format!(
-        "SELECT hero_id, name, localized_name, icon, primary_attr, attack_type, roles
-         FROM {} FINAL",
-        ch.table("heroes")
-    ))
-    .await
+fn fallback_hero_meta() -> HashMap<u16, HeroMeta> {
+    hero_data::HEROES
+        .iter()
+        .map(|hero| {
+            (
+                hero.id,
+                HeroMeta {
+                    hero_id: hero.id,
+                    name: hero.name.to_owned(),
+                    localized_name: hero.localized_name.to_owned(),
+                    icon: hero.icon.to_owned(),
+                    primary_attr: hero.primary_attr.to_owned(),
+                    attack_type: hero.attack_type.to_owned(),
+                    roles: hero.roles.iter().map(|role| (*role).to_owned()).collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn merge_hero_meta(map: &mut HashMap<u16, HeroMeta>, row: HeroMeta) {
+    if let Some(existing) = map.get_mut(&row.hero_id) {
+        if !row.name.is_empty() {
+            existing.name = row.name;
+        }
+        if !row.localized_name.is_empty() {
+            existing.localized_name = row.localized_name;
+        }
+        if !row.icon.is_empty() {
+            existing.icon = row.icon;
+        }
+        if !row.primary_attr.is_empty() {
+            existing.primary_attr = row.primary_attr;
+        }
+        if !row.attack_type.is_empty() {
+            existing.attack_type = row.attack_type;
+        }
+        if !row.roles.is_empty() {
+            existing.roles = row.roles;
+        }
+    } else {
+        map.insert(row.hero_id, row);
+    }
+}
+
+async fn hero_meta(ch: &ClickHouse) -> HashMap<u16, HeroMeta> {
+    let mut heroes = fallback_hero_meta();
+    match ch
+        .query::<HeroMeta>(&format!(
+            "SELECT hero_id, name, localized_name, icon, primary_attr, attack_type, roles
+             FROM {} FINAL",
+            ch.table("heroes")
+        ))
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                merge_hero_meta(&mut heroes, row);
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to load hero metadata from ClickHouse; using hardcoded fallback");
+        }
+    }
+    heroes
 }
 
 #[derive(Serialize)]
@@ -692,12 +746,7 @@ async fn recent_matches(
         ))
         .await
         .map_err(ApiError::internal)?;
-    let meta: HashMap<u16, HeroMeta> = hero_meta(&state.ch)
-        .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .map(|meta| (meta.hero_id, meta))
-        .collect();
+    let meta = hero_meta(&state.ch).await;
     let to_hero = |id: u16| {
         let meta = meta.get(&id);
         let icon = meta.map(|m| m.icon.clone()).unwrap_or_default();

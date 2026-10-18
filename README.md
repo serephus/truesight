@@ -173,6 +173,10 @@ static file deployment is required. Hero objects include `localized_name`,
 Steam's `IEconDOTA2_570/GetHeroes` endpoint. Hero metadata is refreshed even
 when the match collector is disabled, as long as Steam keys are configured.
 
+A compiled-in snapshot of every hero is also used as a fallback: missing rows
+are seeded into the `heroes` table at startup, and the API merges the fallback
+with ClickHouse metadata on read. A Steam refresh always takes precedence.
+
 ## ClickHouse tables
 
 | Table | Engine | Purpose |
