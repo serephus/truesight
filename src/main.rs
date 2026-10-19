@@ -7,6 +7,7 @@ mod model;
 mod period;
 mod ranker;
 mod rating;
+mod redact;
 mod steam;
 mod web;
 
@@ -22,7 +23,14 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::load()?;
-    init_tracing(&cfg.log);
+    let redactor = redact::Redactor::new(
+        cfg.steam
+            .keys
+            .iter()
+            .cloned()
+            .chain(std::iter::once(cfg.clickhouse.password.clone())),
+    );
+    init_tracing(&cfg.log, redactor);
 
     if rustls::crypto::ring::default_provider()
         .install_default()
@@ -130,12 +138,13 @@ async fn migrate_with_retry(ch: &ClickHouse, raw_retention_days: u32) -> Result<
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to initialize ClickHouse")))
 }
 
-fn init_tracing(filter: &str) {
+fn init_tracing(filter: &str, redactor: redact::Redactor) {
     let filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .compact()
+        .with_writer(redact::RedactingMakeWriter::new(redactor))
         .init();
 }
 

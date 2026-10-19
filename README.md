@@ -136,6 +136,21 @@ Secrets can also be supplied through systemd credentials: if
 `$CREDENTIALS_DIRECTORY` exists, Truesight reads `steam_api_keys` and
 `clickhouse_password` from it.
 
+### Log redaction
+
+Tracing output is wrapped in a redacting writer:
+
+- every configured Steam API key and the ClickHouse password are replaced with
+  `[REDACTED]`;
+- values of sensitive query parameters (`key`, `password`, `token`, `secret`,
+  etc.) are masked even if the value was not registered up front;
+- internal `reqwest` URLs are stripped from request errors.
+
+This applies to dependency logs as well. Raw match data is **not** redacted:
+`matches.raw` and `match_players` contain `account_id` when present, but not
+player names — `GetMatchHistoryBySequenceNum` does not return names. If you
+need account IDs dropped or hashed at rest, that is a separate data change.
+
 ## NixOS module
 
 The flake exports `nixosModules.default`:
