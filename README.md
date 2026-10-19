@@ -111,8 +111,8 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_STEAM_API_KEYS_FILE` | — | File containing keys |
 | `TRUESIGHT_STEAM_BASE_URL` | `https://api.steampowered.com` | Override for tests |
 | `TRUESIGHT_COLLECTOR_ENABLED` | `true` | Toggle ingestion |
-| `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Initial poll delay; adapts at runtime |
-| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `250` | Fastest poll interval when behind |
+| `TRUESIGHT_POLL_INTERVAL_MS` | `5000` | Initial poll delay; adapts at runtime |
+| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Fastest poll interval when behind |
 | `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest poll interval when caught up/backing off |
 | `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step when too fresh |
 | `TRUESIGHT_MAX_LAG_SECS` | `3600` | Hard lag ceiling; exceeding it forces catch-up |

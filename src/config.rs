@@ -116,7 +116,7 @@ impl Config {
 
         let batch_size = env_u64("TRUESIGHT_BATCH_SIZE", 100).clamp(1, 100) as u32;
         let min_poll_interval =
-            Duration::from_millis(env_u64("TRUESIGHT_MIN_POLL_INTERVAL_MS", 250))
+            Duration::from_millis(env_u64("TRUESIGHT_MIN_POLL_INTERVAL_MS", 2000))
                 .max(Duration::from_millis(1));
         let max_poll_interval =
             Duration::from_millis(env_u64("TRUESIGHT_MAX_POLL_INTERVAL_MS", 30_000))
@@ -124,7 +124,7 @@ impl Config {
         if min_poll_interval > max_poll_interval {
             bail!("TRUESIGHT_MIN_POLL_INTERVAL_MS must be <= TRUESIGHT_MAX_POLL_INTERVAL_MS");
         }
-        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 2000))
+        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 5000))
             .max(min_poll_interval)
             .min(max_poll_interval);
         let poll_step = Duration::from_millis(env_u64("TRUESIGHT_POLL_STEP_MS", 500))
