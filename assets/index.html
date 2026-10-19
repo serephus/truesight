@@ -18,12 +18,7 @@
   </header>
 
   <nav class="toolbar">
-    <div class="tabs" id="tabs">
-      <button class="tab active" data-view="leaderboard">Leaderboard</button>
-      <button class="tab" data-view="matchups">Matchups</button>
-      <button class="tab" data-view="matches">Recent matches</button>
-    </div>
-    <div class="tabs periods" id="periods">
+    <div class="tabs" id="periods">
       <button class="tab active" data-period="day">Day</button>
       <button class="tab" data-period="week">Week</button>
       <button class="tab" data-period="month">Month</button>
@@ -35,6 +30,7 @@
 
   <main>
     <section id="view-leaderboard" class="view">
+      <h1 class="page-title">Hero leaderboard</h1>
       <div class="summary" id="summary"></div>
       <div class="table-wrap">
         <table class="leaderboard">
@@ -52,22 +48,6 @@
           <tbody id="hero-rows"></tbody>
         </table>
       </div>
-    </section>
-
-    <section id="view-matchups" class="view" hidden>
-      <div class="matchups">
-        <aside class="hero-picker">
-          <h2>Heroes</h2>
-          <div id="hero-picker-list" class="hero-picker-list"></div>
-        </aside>
-        <div id="counter-panel" class="counter-panel">
-          <p class="muted">Pick a hero to see who it beats and loses to.</p>
-        </div>
-      </div>
-    </section>
-
-    <section id="view-matches" class="view" hidden>
-      <div id="matches" class="matches"></div>
     </section>
   </main>
 

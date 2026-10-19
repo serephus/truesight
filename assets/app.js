@@ -1,10 +1,7 @@
 const state = {
-  view: "leaderboard",
   period: "day",
   heroes: [],
   search: "",
-  selectedHero: null,
-  detail: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -14,9 +11,6 @@ const el = {
   error: $("error"),
   summary: $("summary"),
   heroRows: $("hero-rows"),
-  heroPicker: $("hero-picker-list"),
-  counterPanel: $("counter-panel"),
-  matches: $("matches"),
   search: $("search"),
   modal: $("modal"),
   modalBody: $("modal-body"),
@@ -57,12 +51,6 @@ function formatTime(unix) {
   });
 }
 
-function duration(seconds) {
-  const mins = Math.floor((seconds || 0) / 60);
-  const secs = String((seconds || 0) % 60).padStart(2, "0");
-  return `${mins}:${secs}`;
-}
-
 function showError(error) {
   el.error.textContent = error?.message || String(error);
   el.error.hidden = false;
@@ -91,7 +79,6 @@ async function loadHeroes() {
   }
   renderMeta(data);
   renderLeaderboard();
-  renderHeroPicker();
 }
 
 function renderMeta(data) {
@@ -155,72 +142,6 @@ function renderLeaderboard() {
   el.heroRows.querySelectorAll("tr[data-hero]").forEach((row) => {
     row.addEventListener("click", () => openHero(Number(row.dataset.hero)));
   });
-}
-
-function renderHeroPicker() {
-  const heroes = filteredHeroes();
-  if (!heroes.length) {
-    el.heroPicker.innerHTML = `<p class="muted">No heroes.</p>`;
-    return;
-  }
-  el.heroPicker.innerHTML = heroes.map((hero) => `
-    <button class="picker-item ${state.selectedHero === hero.hero_id ? "active" : ""}" data-hero="${hero.hero_id}">
-      ${heroIcon(hero.icon, "small", hero.icon_url)}
-      <span>${esc(hero.localized_name || `#${hero.hero_id}`)}</span>
-      <span class="rating">${num(hero.rating)}</span>
-    </button>`).join("");
-  el.heroPicker.querySelectorAll(".picker-item").forEach((button) => {
-    button.addEventListener("click", () => selectHero(Number(button.dataset.hero)));
-  });
-  if (state.view === "matchups" && (!state.selectedHero || !heroes.some((h) => h.hero_id === state.selectedHero))) {
-    selectHero(heroes[0].hero_id);
-  }
-}
-
-async function selectHero(heroId) {
-  state.selectedHero = heroId;
-  renderHeroPicker();
-  el.counterPanel.innerHTML = `<p class="muted">Loading matchup data…</p>`;
-  try {
-    const detail = await api(`/api/heroes/${heroId}?period=${state.period}`);
-    state.detail = detail;
-    renderCounterPanel(detail);
-  } catch (error) {
-    showError(error);
-  }
-}
-
-function renderCounterPanel(detail) {
-  const hero = detail.hero;
-  const winRate = Number(hero.win_rate || 0) * 100;
-  el.counterPanel.innerHTML = `
-    <div class="counter-head">
-      ${heroIcon(hero.icon, "", hero.icon_url)}
-      <div>
-        <h2>${esc(hero.localized_name || `#${hero.hero_id}`)}</h2>
-        <p>Rating <b>${num(hero.rating)}</b> ${deltaHtml(hero.delta)} · ${num(hero.games)} games · ${winRate.toFixed(1)}% wins</p>
-      </div>
-    </div>
-    ${counterColumns(detail.beats, detail.loses_to)}
-  `;
-}
-
-function counterColumns(beats, losesTo) {
-  const column = (title, counters) => `
-    <div class="counter-col">
-      <h3>${title}</h3>
-      ${counters.length ? counters.map((counter) => `
-        <div class="counter-row">
-          ${heroIcon(counter.icon, "small", counter.icon_url)}
-          <span class="name">${esc(counter.localized_name)}</span>
-          <span class="games">${num(counter.games)}g</span>
-          <span class="rate">${(Number(counter.win_rate) * 100).toFixed(1)}%</span>
-        </div>`).join("") : `<p class="muted">Not enough games yet.</p>`}
-    </div>`;
-  return `<div class="counter-grid">
-    ${column("Beats", beats)}
-    ${column("Loses to", losesTo)}
-  </div>`;
 }
 
 async function openHero(heroId) {
@@ -289,38 +210,22 @@ function ratingChart(history) {
   <div class="chart-note">Last ${history.length} snapshots · ${num(min)}–${num(max)} rating</div>`;
 }
 
-async function loadMatches() {
-  el.matches.innerHTML = `<p class="muted">Loading recent matches…</p>`;
-  try {
-    const data = await api("/api/matches?limit=40");
-    if (!data.matches?.length) {
-      el.matches.innerHTML = `<p class="muted">No matches stored yet.</p>`;
-      return;
-    }
-    el.matches.innerHTML = data.matches.map(matchCard).join("");
-  } catch (error) {
-    showError(error);
-  }
-}
-
-function matchCard(match) {
-  const team = (label, heroes, score, winner) => `
-    <div class="team ${winner ? "winner" : ""}">
-      <span class="team-label ${label}">${label === "radiant" ? "RAD" : "DIRE"}</span>
-      ${heroes.map((hero) => `<span title="${esc(hero.localized_name)}">${heroIcon(hero.icon, "small", hero.icon_url)}</span>`).join("")}
-      <span class="score">${score}</span>
+function counterColumns(beats, losesTo) {
+  const column = (title, counters) => `
+    <div class="counter-col">
+      <h3>${title}</h3>
+      ${counters.length ? counters.map((counter) => `
+        <div class="counter-row">
+          ${heroIcon(counter.icon, "small", counter.icon_url)}
+          <span class="name">${esc(counter.localized_name)}</span>
+          <span class="games">${num(counter.games)}g</span>
+          <span class="rate">${(Number(counter.win_rate) * 100).toFixed(1)}%</span>
+        </div>`).join("") : `<p class="muted">Not enough games yet.</p>`}
     </div>`;
-  return `<article class="match-card">
-    <div class="match-info">
-      <b>${formatTime(match.start_time)}</b>
-      ${duration(match.duration)} · avg rank ${match.avg_rank_tier || "?"}<br>
-      match ${esc(match.match_id)}
-    </div>
-    <div class="match-teams">
-      ${team("radiant", match.radiant_heroes, match.radiant_score, match.radiant_win)}
-      ${team("dire", match.dire_heroes, match.dire_score, !match.radiant_win)}
-    </div>
-  </article>`;
+  return `<div class="counter-grid">
+    ${column("Beats", beats)}
+    ${column("Loses to", losesTo)}
+  </div>`;
 }
 
 function closeModal() {
@@ -328,50 +233,21 @@ function closeModal() {
   document.body.style.overflow = "";
 }
 
-function setView(view) {
-  state.view = view;
-  document.querySelectorAll("#tabs .tab").forEach((tab) => {
-    tab.classList.toggle("active", tab.dataset.view === view);
-  });
-  ["leaderboard", "matchups", "matches"].forEach((name) => {
-    $(`view-${name}`).hidden = name !== view;
-  });
-  if (view === "leaderboard") loadHeroes().catch(showError);
-  if (view === "matchups") {
-    if (!state.heroes.length) {
-      loadHeroes().then(() => {
-        if (state.selectedHero) selectHero(state.selectedHero);
-      }).catch(showError);
-    } else {
-      renderHeroPicker();
-      if (state.selectedHero) selectHero(state.selectedHero);
-    }
-  }
-  if (view === "matches") loadMatches();
-}
-
 function setPeriod(period) {
   state.period = period;
   document.querySelectorAll("#periods .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.period === period);
   });
-  loadHeroes().then(() => {
-    if (state.view === "matchups" && state.selectedHero) {
-      selectHero(state.selectedHero);
-    }
-  }).catch(showError);
+  closeModal();
+  loadHeroes().catch(showError);
 }
 
-document.querySelectorAll("#tabs .tab").forEach((tab) => {
-  tab.addEventListener("click", () => setView(tab.dataset.view));
-});
 document.querySelectorAll("#periods .tab").forEach((tab) => {
   tab.addEventListener("click", () => setPeriod(tab.dataset.period));
 });
 el.search.addEventListener("input", () => {
   state.search = el.search.value;
   renderLeaderboard();
-  renderHeroPicker();
 });
 document.querySelectorAll("[data-close]").forEach((node) => {
   node.addEventListener("click", closeModal);
@@ -381,8 +257,4 @@ document.addEventListener("keydown", (event) => {
 });
 
 loadHeroes().catch(showError);
-setInterval(() => {
-  if (state.view === "leaderboard") loadHeroes().catch(showError);
-  if (state.view === "matchups" && state.selectedHero) selectHero(state.selectedHero);
-  if (state.view === "matches") loadMatches();
-}, 60_000);
+setInterval(() => loadHeroes().catch(showError), 60_000);

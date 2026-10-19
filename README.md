@@ -27,6 +27,27 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
   429/5xx/invalid-key responses.
 
+The collector keeps lag bounded without targeting a fixed lag. Lag is measured
+from the newest processed match end time (`start_time + duration`) to now.
+
+- **Lag above the ceiling** (`TRUESIGHT_MAX_LAG_SECS`, default 1h): speed up
+  multiplicatively (`×0.7`) toward the minimum interval. This is the safety
+  guarantee against accumulating days of backlog.
+- **Lag below the caught-up floor** (`TRUESIGHT_MIN_LAG_SECS`, default 5min):
+  slow down by one step toward the maximum.
+- **Inside the band**: react to the smoothed lag trend. If lag is growing,
+  speed up; if it is shrinking, slow down; if it is stable, hold the current
+  interval.
+- **Empty batch**: slow down; there is nothing to fetch right now.
+- **Fetch/storage errors, 429s, non-advancing batches**: multiply the interval
+  by `2` up to the maximum, on top of per-key cooldown handling.
+
+There is no target lag. The collector holds wherever the lag stabilises inside
+the acceptable band, so it does not deliberately fall back to one hour and does
+not let lag grow without bound. The initial interval is
+`TRUESIGHT_POLL_INTERVAL_MS`; the floor and ceiling are
+`TRUESIGHT_MIN_POLL_INTERVAL_MS` and `TRUESIGHT_MAX_POLL_INTERVAL_MS`.
+
 ## Rating model
 
 For each window (24h, 7d, 30d), Truesight fits a Bradley–Terry model over the 25
@@ -48,8 +69,8 @@ P(hero_a beats hero_b) = sigmoid(r_a - r_b + gamma * radiant_side)
   so ratings never mix patches. Snapshots are labelled with
   `TRUESIGHT_PATCH_NAME`.
 
-Matchup counters and the draft-oriented "beats / loses to" lists are derived
-from the same hourly aggregate table with Beta(1,1) smoothing.
+The hero detail modal shows raw matchup counters and the "beats / loses to"
+lists, derived from the same hourly aggregate table with Beta(1,1) smoothing.
 
 ## Quick start (Nix)
 
@@ -90,7 +111,13 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_STEAM_API_KEYS_FILE` | — | File containing keys |
 | `TRUESIGHT_STEAM_BASE_URL` | `https://api.steampowered.com` | Override for tests |
 | `TRUESIGHT_COLLECTOR_ENABLED` | `true` | Toggle ingestion |
-| `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Poll delay when caught up |
+| `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Initial poll delay; adapts at runtime |
+| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `250` | Fastest poll interval when behind |
+| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest poll interval when caught up/backing off |
+| `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step when too fresh |
+| `TRUESIGHT_MAX_LAG_SECS` | `3600` | Hard lag ceiling; exceeding it forces catch-up |
+| `TRUESIGHT_MIN_LAG_SECS` | `300` | Caught-up floor; below it the collector slows down |
+| `TRUESIGHT_LAG_TREND_THRESHOLD_SECS` | `30` | Lag change that triggers a trend adjustment |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
 | `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |
@@ -164,11 +191,10 @@ systemd credentials, and applies systemd hardening. The ClickHouse data lives in
 | `GET /api/health` | Uptime, checkpoint, stored match count, snapshot times |
 | `GET /api/heroes?period=day\|week\|month` | Latest hero leaderboard |
 | `GET /api/heroes/{hero_id}?period=…&min_games=20` | Hero detail, history, counters |
-| `GET /api/matchups?period=…&min_games=20` | Cross-hero pair win rates |
-| `GET /api/matches?limit=30` | Recent stored matches |
 
 The frontend is embedded in the binary (`assets/`), so no Node build step or
-static file deployment is required. Hero objects include `localized_name`,
+static file deployment is required. The UI is a single leaderboard with search,
+day/week/month switching, and a hero detail modal. Hero objects include `localized_name`,
 `icon`, `icon_url`, `primary_attr`, `attack_type`, and `roles`, loaded from
 Steam's `IEconDOTA2_570/GetHeroes` endpoint. Hero metadata is refreshed even
 when the match collector is disabled, as long as Steam keys are configured.
