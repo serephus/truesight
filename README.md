@@ -147,8 +147,9 @@ Tracing output is wrapped in a redacting writer:
 - internal `reqwest` URLs are stripped from request errors.
 
 This applies to dependency logs as well. Raw match data is **not** redacted:
-`matches.raw` and `match_players` still contain player names and account IDs.
-If you need PII redaction at rest, that is a separate, destructive data change.
+`matches.raw` and `match_players` contain `account_id` when present, but not
+player names — `GetMatchHistoryBySequenceNum` does not return names. If you
+need account IDs dropped or hashed at rest, that is a separate data change.
 
 ## NixOS module
 
