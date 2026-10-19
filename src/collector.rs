@@ -16,26 +16,32 @@ struct StateValue {
 const SPEEDUP_FACTOR: f64 = 0.70;
 const ERROR_BACKOFF_FACTOR: f64 = 2.0;
 const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+const LAG_SMOOTHING: f64 = 0.8;
 
-/// Maintains a target lag behind the live match stream.
+/// Keeps the processing lag bounded without targeting a fixed lag.
 ///
-/// Lag is measured from the newest processed match's end time
-/// (`start_time + duration`) to now. The controller intentionally allows a
-/// steady lag instead of racing all the way to the head:
+/// Lag is measured from the newest processed match end time
+/// (`start_time + duration`) to now.
 ///
-/// - too far behind  -> speed up
-/// - too fresh       -> slow down
-/// - inside the deadband -> keep the current interval
-/// - empty batches   -> slow down (there is nothing to fetch right now)
-/// - errors          -> multiplicative backoff, capped at `max`
+/// - Above `max_lag`: speed up; this is the safety ceiling that prevents
+///   accumulating days of backlog.
+/// - Below `min_lag`: slow down; we are effectively caught up.
+/// - Inside the band: react to the lag trend. If lag is growing, speed up;
+///   if it is shrinking, slow down; if it is stable, hold the interval.
+/// - Empty batches slow down; errors back off multiplicatively.
+///
+/// The controller does not try to sit at a specific lag. It holds wherever
+/// the lag stabilises inside the acceptable band.
 #[derive(Debug, Clone)]
 struct LagController {
     current: Duration,
     min: Duration,
     max: Duration,
     step: Duration,
-    target: Duration,
-    tolerance: Duration,
+    max_lag: u64,
+    min_lag: u64,
+    trend_threshold: f64,
+    smoothed_lag: Option<f64>,
     last_match_end: Option<u64>,
 }
 
@@ -45,8 +51,9 @@ impl LagController {
         min: Duration,
         max: Duration,
         step: Duration,
-        target: Duration,
-        tolerance: Duration,
+        max_lag: Duration,
+        min_lag: Duration,
+        trend_threshold: Duration,
     ) -> Self {
         let min = min.max(Duration::from_millis(1));
         let max = max.max(min);
@@ -55,8 +62,10 @@ impl LagController {
             min,
             max,
             step: step.max(Duration::from_millis(1)),
-            target,
-            tolerance,
+            max_lag: max_lag.as_secs(),
+            min_lag: min_lag.as_secs(),
+            trend_threshold: trend_threshold.as_secs_f64(),
+            smoothed_lag: None,
             last_match_end: None,
         }
     }
@@ -68,11 +77,27 @@ impl LagController {
         let Some(lag) = self.lag(now) else {
             return;
         };
-        let target = self.target.as_secs();
-        let tolerance = self.tolerance.as_secs();
-        if lag > target.saturating_add(tolerance) {
+
+        let lag_value = lag as f64;
+        let trend = match self.smoothed_lag {
+            None => {
+                self.smoothed_lag = Some(lag_value);
+                0.0
+            }
+            Some(previous) => {
+                let smoothed = LAG_SMOOTHING * previous + (1.0 - LAG_SMOOTHING) * lag_value;
+                self.smoothed_lag = Some(smoothed);
+                lag_value - smoothed
+            }
+        };
+
+        if lag > self.max_lag {
             self.speed_up();
-        } else if lag < target.saturating_sub(tolerance) {
+        } else if lag < self.min_lag {
+            self.slow_down();
+        } else if trend > self.trend_threshold {
+            self.speed_up();
+        } else if trend < -self.trend_threshold {
             self.slow_down();
         }
     }
@@ -93,8 +118,8 @@ impl LagController {
         self.last_match_end.map(|end| now.saturating_sub(end))
     }
 
-    fn target_secs(&self) -> u64 {
-        self.target.as_secs()
+    fn max_lag_secs(&self) -> u64 {
+        self.max_lag
     }
 
     fn speed_up(&mut self) {
@@ -150,8 +175,9 @@ pub async fn run(
         cfg.min_poll_interval,
         cfg.max_poll_interval,
         cfg.poll_step,
-        cfg.target_lag,
-        cfg.lag_tolerance,
+        cfg.max_lag,
+        cfg.min_lag,
+        cfg.lag_trend_threshold,
     );
 
     loop {
@@ -170,7 +196,7 @@ pub async fn run(
                     cursor,
                     interval_ms = rate.delay().as_millis(),
                     lag_secs = rate.lag(now).unwrap_or(0),
-                    target_lag_secs = rate.target_secs(),
+                    max_lag_secs = rate.max_lag_secs(),
                     "no new matches from the steam sequence stream"
                 );
                 if !sleep_or_cancel(&ct, rate.delay()).await {
@@ -240,7 +266,7 @@ pub async fn run(
                     rated,
                     interval_ms = rate.delay().as_millis(),
                     lag_secs = rate.lag(now).unwrap_or(0),
-                    target_lag_secs = rate.target_secs(),
+                    max_lag_secs = rate.max_lag_secs(),
                     "stored sequence batch"
                 );
                 if !sleep_or_cancel(&ct, rate.delay()).await {
@@ -386,38 +412,55 @@ mod tests {
             Duration::from_millis(500),
             Duration::from_secs(3600),
             Duration::from_secs(300),
+            Duration::from_secs(30),
         )
     }
 
-    fn end_for_lag(lag_secs: u64) -> Option<u64> {
-        Some(NOW.saturating_sub(lag_secs))
+    fn observe(rate: &mut LagController, lag_secs: u64, now: u64) {
+        rate.on_batch(Some(now.saturating_sub(lag_secs)), now);
     }
 
     #[test]
-    fn holds_when_inside_the_target_band() {
+    fn holds_inside_the_band_when_lag_is_stable() {
         let mut rate = controller();
-        rate.on_batch(end_for_lag(3600), NOW);
-        assert_eq!(rate.delay(), Duration::from_secs(2));
-        rate.on_batch(end_for_lag(3300), NOW);
-        assert_eq!(rate.delay(), Duration::from_secs(2));
-        rate.on_batch(end_for_lag(3900), NOW);
+        for index in 0..10 {
+            observe(&mut rate, 1200, NOW + index * 60);
+        }
         assert_eq!(rate.delay(), Duration::from_secs(2));
     }
 
     #[test]
-    fn speeds_up_when_too_far_behind() {
+    fn speeds_up_when_lag_grows() {
         let mut rate = controller();
-        for _ in 0..20 {
-            rate.on_batch(end_for_lag(7200), NOW);
+        for index in 1..=20 {
+            observe(&mut rate, 1200 + index * 60, NOW + index * 60);
         }
         assert_eq!(rate.delay(), Duration::from_millis(250));
     }
 
     #[test]
-    fn slows_down_when_too_fresh() {
+    fn slows_down_when_lag_shrinks() {
         let mut rate = controller();
-        for _ in 0..100 {
-            rate.on_batch(end_for_lag(600), NOW);
+        for index in 1..=20 {
+            observe(&mut rate, 1800 - index * 60, NOW + index * 60);
+        }
+        assert!(rate.delay() > Duration::from_secs(2));
+    }
+
+    #[test]
+    fn above_the_ceiling_speeds_up() {
+        let mut rate = controller();
+        for index in 0..20 {
+            observe(&mut rate, 7200, NOW + index * 60);
+        }
+        assert_eq!(rate.delay(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn below_the_caught_up_floor_slows_down() {
+        let mut rate = controller();
+        for index in 0..100 {
+            observe(&mut rate, 60, NOW + index * 60);
         }
         assert_eq!(rate.delay(), Duration::from_secs(30));
     }
@@ -449,7 +492,7 @@ mod tests {
             rate.on_error();
         }
         let before = rate.delay();
-        rate.on_batch(end_for_lag(7200), NOW);
+        observe(&mut rate, 7200, NOW);
         assert!(rate.delay() < before);
     }
 
@@ -464,6 +507,7 @@ mod tests {
                 Duration::from_millis(500),
                 Duration::from_secs(3600),
                 Duration::from_secs(300),
+                Duration::from_secs(30),
             )
             .delay(),
             max
@@ -476,6 +520,7 @@ mod tests {
                 Duration::from_millis(500),
                 Duration::from_secs(3600),
                 Duration::from_secs(300),
+                Duration::from_secs(30),
             )
             .delay(),
             Duration::from_millis(250)
