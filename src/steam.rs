@@ -189,7 +189,7 @@ impl SteamClient {
                 }
                 Err(error) => {
                     self.mark_failure(index, Duration::from_secs(5));
-                    last_error = Some(anyhow!("Steam request failed: {error}"));
+                    last_error = Some(anyhow!("Steam request failed: {}", error.without_url()));
                 }
             }
 
