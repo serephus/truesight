@@ -27,16 +27,21 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
   429/5xx/invalid-key responses.
 
-The collector adapts its polling interval to keep up with the sequence stream:
+The collector targets a steady lag behind the live stream rather than racing all
+the way to the head. Lag is measured from the newest processed match end time
+(`start_time + duration`) to now.
 
-- **Full batch → behind**: decrease multiplicatively (`×0.65`) toward the
+- **Lag > target + tolerance**: speed up multiplicatively (`×0.7`) toward the
   minimum interval.
-- **Partial batch → near the head**: increase gently by half a step.
-- **Empty batch → caught up**: increase by a full step toward the maximum.
+- **Lag < target - tolerance**: slow down by one step toward the maximum.
+- **Inside the deadband**: keep the current interval.
+- **Empty batch**: slow down; there is nothing to fetch right now.
 - **Fetch/storage errors, 429s, non-advancing batches**: multiply the interval
   by `2` up to the maximum, on top of per-key cooldown handling.
 
-The initial interval is `TRUESIGHT_POLL_INTERVAL_MS`; the floor and ceiling are
+The default target is one hour with a five-minute deadband. This keeps the
+backlog roughly constant instead of letting it grow by an hour per day. The
+initial interval is `TRUESIGHT_POLL_INTERVAL_MS`; the floor and ceiling are
 `TRUESIGHT_MIN_POLL_INTERVAL_MS` and `TRUESIGHT_MAX_POLL_INTERVAL_MS`.
 
 ## Rating model
@@ -105,7 +110,9 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Initial poll delay; adapts at runtime |
 | `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `250` | Fastest poll interval when behind |
 | `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest poll interval when caught up/backing off |
-| `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step near the head |
+| `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step when too fresh |
+| `TRUESIGHT_TARGET_LAG_SECS` | `3600` | Desired steady lag behind the newest match end |
+| `TRUESIGHT_LAG_TOLERANCE_SECS` | `300` | Deadband around the target lag |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
 | `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |

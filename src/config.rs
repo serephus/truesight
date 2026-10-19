@@ -43,6 +43,10 @@ pub struct CollectorConfig {
     pub min_poll_interval: Duration,
     pub max_poll_interval: Duration,
     pub poll_step: Duration,
+    /// Desired steady-state lag behind the match stream.
+    pub target_lag: Duration,
+    /// Acceptable drift around `target_lag` before the controller reacts.
+    pub lag_tolerance: Duration,
     pub batch_size: u32,
     pub start_seq: Option<u64>,
 }
@@ -123,6 +127,8 @@ impl Config {
             .min(max_poll_interval);
         let poll_step = Duration::from_millis(env_u64("TRUESIGHT_POLL_STEP_MS", 500))
             .max(Duration::from_millis(1));
+        let target_lag = Duration::from_secs(env_u64("TRUESIGHT_TARGET_LAG_SECS", 3600));
+        let lag_tolerance = Duration::from_secs(env_u64("TRUESIGHT_LAG_TOLERANCE_SECS", 300));
 
         let patch_start = env_string("TRUESIGHT_PATCH_START")
             .and_then(|v| v.parse::<u32>().ok())
@@ -145,6 +151,8 @@ impl Config {
                 min_poll_interval,
                 max_poll_interval,
                 poll_step,
+                target_lag,
+                lag_tolerance,
                 batch_size,
                 start_seq: env_string("TRUESIGHT_START_SEQ").and_then(|v| v.parse().ok()),
             },

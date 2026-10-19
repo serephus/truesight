@@ -13,26 +13,41 @@ struct StateValue {
     value: String,
 }
 
-const SPEEDUP_FACTOR: f64 = 0.65;
+const SPEEDUP_FACTOR: f64 = 0.70;
 const ERROR_BACKOFF_FACTOR: f64 = 2.0;
 const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Adaptive polling interval for the sequence stream.
+/// Maintains a target lag behind the live match stream.
 ///
-/// - A full batch means the collector is behind: speed up gradually.
-/// - A partial batch means it is close to the head: slow down gently.
-/// - An empty batch means it is caught up: slow down further.
-/// - Any request/storage error backs off multiplicatively, capped at `max`.
+/// Lag is measured from the newest processed match's end time
+/// (`start_time + duration`) to now. The controller intentionally allows a
+/// steady lag instead of racing all the way to the head:
+///
+/// - too far behind  -> speed up
+/// - too fresh       -> slow down
+/// - inside the deadband -> keep the current interval
+/// - empty batches   -> slow down (there is nothing to fetch right now)
+/// - errors          -> multiplicative backoff, capped at `max`
 #[derive(Debug, Clone)]
-struct AdaptiveRate {
+struct LagController {
     current: Duration,
     min: Duration,
     max: Duration,
     step: Duration,
+    target: Duration,
+    tolerance: Duration,
+    last_match_end: Option<u64>,
 }
 
-impl AdaptiveRate {
-    fn new(initial: Duration, min: Duration, max: Duration, step: Duration) -> Self {
+impl LagController {
+    fn new(
+        initial: Duration,
+        min: Duration,
+        max: Duration,
+        step: Duration,
+        target: Duration,
+        tolerance: Duration,
+    ) -> Self {
         let min = min.max(Duration::from_millis(1));
         let max = max.max(min);
         Self {
@@ -40,20 +55,30 @@ impl AdaptiveRate {
             min,
             max,
             step: step.max(Duration::from_millis(1)),
+            target,
+            tolerance,
+            last_match_end: None,
         }
     }
 
-    fn on_batch(&mut self, fetched: usize, batch_size: u32) {
-        if batch_size == 0 {
+    fn on_batch(&mut self, newest_match_end: Option<u64>, now: u64) {
+        if let Some(end) = newest_match_end {
+            self.last_match_end = Some(self.last_match_end.map_or(end, |old| old.max(end)));
+        }
+        let Some(lag) = self.lag(now) else {
             return;
+        };
+        let target = self.target.as_secs();
+        let tolerance = self.tolerance.as_secs();
+        if lag > target.saturating_add(tolerance) {
+            self.speed_up();
+        } else if lag < target.saturating_sub(tolerance) {
+            self.slow_down();
         }
-        if fetched >= batch_size as usize {
-            self.current = self.current.mul_f64(SPEEDUP_FACTOR).max(self.min);
-        } else if fetched == 0 {
-            self.current = (self.current + self.step).min(self.max);
-        } else {
-            self.current = (self.current + self.step.mul_f64(0.5)).min(self.max);
-        }
+    }
+
+    fn on_empty(&mut self) {
+        self.slow_down();
     }
 
     fn on_error(&mut self) {
@@ -62,6 +87,22 @@ impl AdaptiveRate {
             .mul_f64(ERROR_BACKOFF_FACTOR)
             .max(MIN_ERROR_BACKOFF);
         self.current = backoff.min(self.max).max(self.min);
+    }
+
+    fn lag(&self, now: u64) -> Option<u64> {
+        self.last_match_end.map(|end| now.saturating_sub(end))
+    }
+
+    fn target_secs(&self) -> u64 {
+        self.target.as_secs()
+    }
+
+    fn speed_up(&mut self) {
+        self.current = self.current.mul_f64(SPEEDUP_FACTOR).max(self.min);
+    }
+
+    fn slow_down(&mut self) {
+        self.current = (self.current + self.step).min(self.max);
     }
 
     fn delay(&self) -> Duration {
@@ -104,11 +145,13 @@ pub async fn run(
         }
     };
 
-    let mut rate = AdaptiveRate::new(
+    let mut rate = LagController::new(
         cfg.poll_interval,
         cfg.min_poll_interval,
         cfg.max_poll_interval,
         cfg.poll_step,
+        cfg.target_lag,
+        cfg.lag_tolerance,
     );
 
     loop {
@@ -121,17 +164,21 @@ pub async fn run(
             .await
         {
             Ok(matches) if matches.is_empty() => {
-                rate.on_batch(0, cfg.batch_size);
+                rate.on_empty();
+                let now = now_secs();
                 debug!(
                     cursor,
                     interval_ms = rate.delay().as_millis(),
-                    "caught up with the steam sequence stream"
+                    lag_secs = rate.lag(now).unwrap_or(0),
+                    target_lag_secs = rate.target_secs(),
+                    "no new matches from the steam sequence stream"
                 );
                 if !sleep_or_cancel(&ct, rate.delay()).await {
                     break;
                 }
             }
             Ok(matches) => {
+                let newest_end = newest_match_end(&matches);
                 let batch_end = matches
                     .iter()
                     .filter_map(|m| m.get("match_seq_num").and_then(|v| v.as_u64()))
@@ -184,13 +231,16 @@ pub async fn run(
                     continue;
                 }
 
-                rate.on_batch(matches.len(), cfg.batch_size);
+                let now = now_secs();
+                rate.on_batch(newest_end, now);
                 debug!(
                     cursor,
                     fetched = matches.len(),
                     stored,
                     rated,
                     interval_ms = rate.delay().as_millis(),
+                    lag_secs = rate.lag(now).unwrap_or(0),
+                    target_lag_secs = rate.target_secs(),
                     "stored sequence batch"
                 );
                 if !sleep_or_cancel(&ct, rate.delay()).await {
@@ -293,6 +343,27 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn newest_match_end(matches: &[serde_json::Value]) -> Option<u64> {
+    matches
+        .iter()
+        .filter_map(|m| {
+            let start = m
+                .get("start_time")
+                .and_then(|v| v.as_u64())
+                .filter(|v| *v > 0)?;
+            let duration = m.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some(start.saturating_add(duration))
+        })
+        .max()
+}
+
 async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {
     tokio::select! {
         _ = ct.cancelled() => false,
@@ -303,47 +374,66 @@ async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn rate() -> AdaptiveRate {
-        AdaptiveRate::new(
+    const NOW: u64 = 1_800_000_000;
+
+    fn controller() -> LagController {
+        LagController::new(
             Duration::from_secs(2),
             Duration::from_millis(250),
             Duration::from_secs(30),
             Duration::from_millis(500),
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
         )
     }
 
+    fn end_for_lag(lag_secs: u64) -> Option<u64> {
+        Some(NOW.saturating_sub(lag_secs))
+    }
+
     #[test]
-    fn full_batches_speed_up_to_min() {
-        let mut rate = rate();
+    fn holds_when_inside_the_target_band() {
+        let mut rate = controller();
+        rate.on_batch(end_for_lag(3600), NOW);
+        assert_eq!(rate.delay(), Duration::from_secs(2));
+        rate.on_batch(end_for_lag(3300), NOW);
+        assert_eq!(rate.delay(), Duration::from_secs(2));
+        rate.on_batch(end_for_lag(3900), NOW);
+        assert_eq!(rate.delay(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn speeds_up_when_too_far_behind() {
+        let mut rate = controller();
         for _ in 0..20 {
-            rate.on_batch(100, 100);
+            rate.on_batch(end_for_lag(7200), NOW);
         }
         assert_eq!(rate.delay(), Duration::from_millis(250));
     }
 
     #[test]
-    fn empty_batches_slow_down_to_max() {
-        let mut rate = rate();
+    fn slows_down_when_too_fresh() {
+        let mut rate = controller();
         for _ in 0..100 {
-            rate.on_batch(0, 100);
+            rate.on_batch(end_for_lag(600), NOW);
         }
         assert_eq!(rate.delay(), Duration::from_secs(30));
     }
 
     #[test]
-    fn partial_batches_back_off_slower_than_empty_batches() {
-        let mut partial = rate();
-        partial.on_batch(50, 100);
-        let mut empty = rate();
-        empty.on_batch(0, 100);
-        assert!(partial.delay() < empty.delay());
-        assert!(partial.delay() > Duration::from_secs(2));
+    fn empty_batches_slow_down_to_max() {
+        let mut rate = controller();
+        for _ in 0..100 {
+            rate.on_empty();
+        }
+        assert_eq!(rate.delay(), Duration::from_secs(30));
     }
 
     #[test]
     fn errors_back_off_and_cap_at_max() {
-        let mut rate = rate();
+        let mut rate = controller();
         rate.on_error();
         assert!(rate.delay() >= Duration::from_secs(1));
         for _ in 0..20 {
@@ -353,37 +443,58 @@ mod tests {
     }
 
     #[test]
-    fn full_batch_recovers_after_error() {
-        let mut rate = rate();
+    fn behind_speeds_up_after_errors() {
+        let mut rate = controller();
         for _ in 0..10 {
             rate.on_error();
         }
         let before = rate.delay();
-        rate.on_batch(100, 100);
+        rate.on_batch(end_for_lag(7200), NOW);
         assert!(rate.delay() < before);
     }
 
     #[test]
     fn initial_interval_is_clamped() {
+        let max = Duration::from_secs(30);
         assert_eq!(
-            AdaptiveRate::new(
+            LagController::new(
                 Duration::from_secs(100),
                 Duration::from_millis(250),
-                Duration::from_secs(30),
+                max,
                 Duration::from_millis(500),
+                Duration::from_secs(3600),
+                Duration::from_secs(300),
             )
             .delay(),
-            Duration::from_secs(30)
+            max
         );
         assert_eq!(
-            AdaptiveRate::new(
+            LagController::new(
                 Duration::from_millis(1),
                 Duration::from_millis(250),
-                Duration::from_secs(30),
+                max,
                 Duration::from_millis(500),
+                Duration::from_secs(3600),
+                Duration::from_secs(300),
             )
             .delay(),
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn lag_uses_the_newest_match_end_time() {
+        let matches = vec![
+            json!({ "start_time": 1000, "duration": 500 }),
+            json!({ "start_time": 2000, "duration": 100 }),
+            json!({ "start_time": 2500 }),
+        ];
+        assert_eq!(newest_match_end(&matches), Some(2500));
+    }
+
+    #[test]
+    fn ignores_matches_without_start_time() {
+        let matches = vec![json!({ "duration": 500 }), json!({ "start_time": 0 })];
+        assert_eq!(newest_match_end(&matches), None);
     }
 }

@@ -92,6 +92,16 @@ in
         default = 500;
         description = "Additive step used when slowing down near the head.";
       };
+      targetLagSeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 3600;
+        description = "Target steady-state lag behind the newest match end time.";
+      };
+      lagToleranceSeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 300;
+        description = "Deadband around targetLagSeconds before adjusting the interval.";
+      };
       batchSize = lib.mkOption {
         type = lib.types.ints.between 1 100;
         default = 100;
@@ -286,6 +296,8 @@ in
             "TRUESIGHT_MIN_POLL_INTERVAL_MS=${toString cfg.collector.minPollIntervalMs}"
             "TRUESIGHT_MAX_POLL_INTERVAL_MS=${toString cfg.collector.maxPollIntervalMs}"
             "TRUESIGHT_POLL_STEP_MS=${toString cfg.collector.pollStepMs}"
+            "TRUESIGHT_TARGET_LAG_SECS=${toString cfg.collector.targetLagSeconds}"
+            "TRUESIGHT_LAG_TOLERANCE_SECS=${toString cfg.collector.lagToleranceSeconds}"
             "TRUESIGHT_BATCH_SIZE=${toString cfg.collector.batchSize}"
             "TRUESIGHT_RANKER_ENABLED=${bool cfg.ranker.enable}"
             "TRUESIGHT_RANK_INTERVAL_SECS=${toString cfg.ranker.interval}"
