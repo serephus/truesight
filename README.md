@@ -27,6 +27,18 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
   429/5xx/invalid-key responses.
 
+The collector adapts its polling interval to keep up with the sequence stream:
+
+- **Full batch → behind**: decrease multiplicatively (`×0.65`) toward the
+  minimum interval.
+- **Partial batch → near the head**: increase gently by half a step.
+- **Empty batch → caught up**: increase by a full step toward the maximum.
+- **Fetch/storage errors, 429s, non-advancing batches**: multiply the interval
+  by `2` up to the maximum, on top of per-key cooldown handling.
+
+The initial interval is `TRUESIGHT_POLL_INTERVAL_MS`; the floor and ceiling are
+`TRUESIGHT_MIN_POLL_INTERVAL_MS` and `TRUESIGHT_MAX_POLL_INTERVAL_MS`.
+
 ## Rating model
 
 For each window (24h, 7d, 30d), Truesight fits a Bradley–Terry model over the 25
@@ -90,7 +102,10 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_STEAM_API_KEYS_FILE` | — | File containing keys |
 | `TRUESIGHT_STEAM_BASE_URL` | `https://api.steampowered.com` | Override for tests |
 | `TRUESIGHT_COLLECTOR_ENABLED` | `true` | Toggle ingestion |
-| `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Poll delay when caught up |
+| `TRUESIGHT_POLL_INTERVAL_MS` | `2000` | Initial poll delay; adapts at runtime |
+| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `250` | Fastest poll interval when behind |
+| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest poll interval when caught up/backing off |
+| `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step near the head |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
 | `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |

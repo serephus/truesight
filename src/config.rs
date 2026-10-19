@@ -38,7 +38,11 @@ pub struct SteamConfig {
 #[derive(Debug, Clone)]
 pub struct CollectorConfig {
     pub enabled: bool,
+    /// Initial polling interval. The collector adapts this at runtime.
     pub poll_interval: Duration,
+    pub min_poll_interval: Duration,
+    pub max_poll_interval: Duration,
+    pub poll_step: Duration,
     pub batch_size: u32,
     pub start_seq: Option<u64>,
 }
@@ -105,7 +109,20 @@ impl Config {
         };
 
         let batch_size = env_u64("TRUESIGHT_BATCH_SIZE", 100).clamp(1, 100) as u32;
-        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 2000));
+        let min_poll_interval =
+            Duration::from_millis(env_u64("TRUESIGHT_MIN_POLL_INTERVAL_MS", 250))
+                .max(Duration::from_millis(1));
+        let max_poll_interval =
+            Duration::from_millis(env_u64("TRUESIGHT_MAX_POLL_INTERVAL_MS", 30_000))
+                .max(Duration::from_millis(1));
+        if min_poll_interval > max_poll_interval {
+            bail!("TRUESIGHT_MIN_POLL_INTERVAL_MS must be <= TRUESIGHT_MAX_POLL_INTERVAL_MS");
+        }
+        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 2000))
+            .max(min_poll_interval)
+            .min(max_poll_interval);
+        let poll_step = Duration::from_millis(env_u64("TRUESIGHT_POLL_STEP_MS", 500))
+            .max(Duration::from_millis(1));
 
         let patch_start = env_string("TRUESIGHT_PATCH_START")
             .and_then(|v| v.parse::<u32>().ok())
@@ -125,6 +142,9 @@ impl Config {
             collector: CollectorConfig {
                 enabled: collector_enabled,
                 poll_interval,
+                min_poll_interval,
+                max_poll_interval,
+                poll_step,
                 batch_size,
                 start_seq: env_string("TRUESIGHT_START_SEQ").and_then(|v| v.parse().ok()),
             },

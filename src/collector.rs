@@ -13,6 +13,62 @@ struct StateValue {
     value: String,
 }
 
+const SPEEDUP_FACTOR: f64 = 0.65;
+const ERROR_BACKOFF_FACTOR: f64 = 2.0;
+const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Adaptive polling interval for the sequence stream.
+///
+/// - A full batch means the collector is behind: speed up gradually.
+/// - A partial batch means it is close to the head: slow down gently.
+/// - An empty batch means it is caught up: slow down further.
+/// - Any request/storage error backs off multiplicatively, capped at `max`.
+#[derive(Debug, Clone)]
+struct AdaptiveRate {
+    current: Duration,
+    min: Duration,
+    max: Duration,
+    step: Duration,
+}
+
+impl AdaptiveRate {
+    fn new(initial: Duration, min: Duration, max: Duration, step: Duration) -> Self {
+        let min = min.max(Duration::from_millis(1));
+        let max = max.max(min);
+        Self {
+            current: initial.max(min).min(max),
+            min,
+            max,
+            step: step.max(Duration::from_millis(1)),
+        }
+    }
+
+    fn on_batch(&mut self, fetched: usize, batch_size: u32) {
+        if batch_size == 0 {
+            return;
+        }
+        if fetched >= batch_size as usize {
+            self.current = self.current.mul_f64(SPEEDUP_FACTOR).max(self.min);
+        } else if fetched == 0 {
+            self.current = (self.current + self.step).min(self.max);
+        } else {
+            self.current = (self.current + self.step.mul_f64(0.5)).min(self.max);
+        }
+    }
+
+    fn on_error(&mut self) {
+        let backoff = self
+            .current
+            .mul_f64(ERROR_BACKOFF_FACTOR)
+            .max(MIN_ERROR_BACKOFF);
+        self.current = backoff.min(self.max).max(self.min);
+    }
+
+    fn delay(&self) -> Duration {
+        self.current
+    }
+}
+
 pub async fn run(
     ch: ClickHouse,
     steam: SteamClient,
@@ -48,7 +104,13 @@ pub async fn run(
         }
     };
 
-    let mut consecutive_errors = 0u32;
+    let mut rate = AdaptiveRate::new(
+        cfg.poll_interval,
+        cfg.min_poll_interval,
+        cfg.max_poll_interval,
+        cfg.poll_step,
+    );
+
     loop {
         if ct.is_cancelled() {
             break;
@@ -59,65 +121,92 @@ pub async fn run(
             .await
         {
             Ok(matches) if matches.is_empty() => {
-                debug!(cursor, "caught up with the steam sequence stream");
-                if !sleep_or_cancel(&ct, cfg.poll_interval).await {
+                rate.on_batch(0, cfg.batch_size);
+                debug!(
+                    cursor,
+                    interval_ms = rate.delay().as_millis(),
+                    "caught up with the steam sequence stream"
+                );
+                if !sleep_or_cancel(&ct, rate.delay()).await {
                     break;
                 }
             }
             Ok(matches) => {
-                consecutive_errors = 0;
                 let batch_end = matches
                     .iter()
                     .filter_map(|m| m.get("match_seq_num").and_then(|v| v.as_u64()))
                     .max()
                     .unwrap_or(cursor);
                 if batch_end <= cursor {
+                    rate.on_error();
                     warn!(
                         cursor,
-                        batch_end, "Steam returned a non-advancing sequence batch"
+                        batch_end,
+                        interval_ms = rate.delay().as_millis(),
+                        "Steam returned a non-advancing sequence batch; backing off"
                     );
-                    if !sleep_or_cancel(&ct, cfg.poll_interval).await {
+                    if !sleep_or_cancel(&ct, rate.delay()).await {
                         break;
                     }
                     continue;
                 }
+
                 let token = format!("{}-{}", cursor.saturating_add(1), batch_end);
-                match store_batch(&ch, &matches, &token).await {
-                    Ok((stored, rated)) => {
-                        cursor = batch_end.max(cursor);
-                        save_cursor(&ch, cursor).await?;
-                        debug!(
-                            cursor,
-                            fetched = matches.len(),
-                            stored,
-                            rated,
-                            "stored sequence batch"
-                        );
-                    }
+                let (stored, rated) = match store_batch(&ch, &matches, &token).await {
+                    Ok(result) => result,
                     Err(error) => {
-                        warn!(%error, token, "failed to store batch, will retry");
-                        if !sleep_or_cancel(&ct, retry_delay(consecutive_errors)).await {
+                        rate.on_error();
+                        warn!(
+                            %error,
+                            token,
+                            interval_ms = rate.delay().as_millis(),
+                            "failed to store batch, will retry"
+                        );
+                        if !sleep_or_cancel(&ct, rate.delay()).await {
                             break;
                         }
-                        consecutive_errors = consecutive_errors.saturating_add(1);
                         continue;
                     }
-                }
+                };
 
-                if matches.len() < cfg.batch_size as usize {
-                    if !sleep_or_cancel(&ct, cfg.poll_interval).await {
+                cursor = batch_end.max(cursor);
+                if let Err(error) = save_cursor(&ch, cursor).await {
+                    rate.on_error();
+                    warn!(
+                        %error,
+                        cursor,
+                        interval_ms = rate.delay().as_millis(),
+                        "failed to save collector checkpoint, will retry"
+                    );
+                    if !sleep_or_cancel(&ct, rate.delay()).await {
                         break;
                     }
-                } else {
-                    tokio::task::yield_now().await;
+                    continue;
+                }
+
+                rate.on_batch(matches.len(), cfg.batch_size);
+                debug!(
+                    cursor,
+                    fetched = matches.len(),
+                    stored,
+                    rated,
+                    interval_ms = rate.delay().as_millis(),
+                    "stored sequence batch"
+                );
+                if !sleep_or_cancel(&ct, rate.delay()).await {
+                    break;
                 }
             }
             Err(error) => {
-                warn!(%error, "steam fetch failed");
-                if !sleep_or_cancel(&ct, retry_delay(consecutive_errors)).await {
+                rate.on_error();
+                warn!(
+                    %error,
+                    interval_ms = rate.delay().as_millis(),
+                    "steam fetch failed; backing off"
+                );
+                if !sleep_or_cancel(&ct, rate.delay()).await {
                     break;
                 }
-                consecutive_errors = consecutive_errors.saturating_add(1);
             }
         }
     }
@@ -125,7 +214,6 @@ pub async fn run(
     info!(cursor, "collector stopped");
     Ok(())
 }
-
 async fn store_batch(
     ch: &ClickHouse,
     values: &[serde_json::Value],
@@ -205,13 +293,97 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn retry_delay(consecutive_errors: u32) -> Duration {
-    Duration::from_secs(2u64.saturating_pow(consecutive_errors.min(5)).min(30))
-}
-
 async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {
     tokio::select! {
         _ = ct.cancelled() => false,
         _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate() -> AdaptiveRate {
+        AdaptiveRate::new(
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        )
+    }
+
+    #[test]
+    fn full_batches_speed_up_to_min() {
+        let mut rate = rate();
+        for _ in 0..20 {
+            rate.on_batch(100, 100);
+        }
+        assert_eq!(rate.delay(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn empty_batches_slow_down_to_max() {
+        let mut rate = rate();
+        for _ in 0..100 {
+            rate.on_batch(0, 100);
+        }
+        assert_eq!(rate.delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn partial_batches_back_off_slower_than_empty_batches() {
+        let mut partial = rate();
+        partial.on_batch(50, 100);
+        let mut empty = rate();
+        empty.on_batch(0, 100);
+        assert!(partial.delay() < empty.delay());
+        assert!(partial.delay() > Duration::from_secs(2));
+    }
+
+    #[test]
+    fn errors_back_off_and_cap_at_max() {
+        let mut rate = rate();
+        rate.on_error();
+        assert!(rate.delay() >= Duration::from_secs(1));
+        for _ in 0..20 {
+            rate.on_error();
+        }
+        assert_eq!(rate.delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn full_batch_recovers_after_error() {
+        let mut rate = rate();
+        for _ in 0..10 {
+            rate.on_error();
+        }
+        let before = rate.delay();
+        rate.on_batch(100, 100);
+        assert!(rate.delay() < before);
+    }
+
+    #[test]
+    fn initial_interval_is_clamped() {
+        assert_eq!(
+            AdaptiveRate::new(
+                Duration::from_secs(100),
+                Duration::from_millis(250),
+                Duration::from_secs(30),
+                Duration::from_millis(500),
+            )
+            .delay(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            AdaptiveRate::new(
+                Duration::from_millis(1),
+                Duration::from_millis(250),
+                Duration::from_secs(30),
+                Duration::from_millis(500),
+            )
+            .delay(),
+            Duration::from_millis(250)
+        );
     }
 }
