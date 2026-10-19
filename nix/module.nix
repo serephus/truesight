@@ -74,12 +74,12 @@ in
       };
       pollIntervalMs = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 2000;
+        default = 5000;
         description = "Initial polling interval; the collector adapts between the min and max values.";
       };
       minPollIntervalMs = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 250;
+        default = 2000;
         description = "Fastest polling interval when the collector is behind.";
       };
       maxPollIntervalMs = lib.mkOption {
