@@ -57,8 +57,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/heroes", get(heroes))
         .route("/api/heroes/{hero_id}", get(hero_detail))
-        .route("/api/matchups", get(matchups))
-        .route("/api/matches", get(recent_matches))
         .with_state(state)
 }
 
@@ -107,11 +105,6 @@ struct PeriodQuery {
 struct HeroQuery {
     period: Option<String>,
     min_games: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct MatchesQuery {
-    limit: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -537,47 +530,6 @@ async fn latest_model(ch: &ClickHouse, period: Period) -> Result<Option<ModelRow
     Ok(rows.into_iter().next())
 }
 
-#[derive(Serialize)]
-struct MatchupsResponse {
-    period: &'static str,
-    pairs: Vec<MatchupDto>,
-}
-
-#[derive(Serialize)]
-struct MatchupDto {
-    a: u16,
-    b: u16,
-    games: u64,
-    a_wins: u64,
-    a_win_rate: f64,
-}
-
-async fn matchups(
-    State(state): State<AppState>,
-    Query(query): Query<HeroQuery>,
-) -> Result<Json<MatchupsResponse>, ApiError> {
-    let period = parse_period(query.period.as_deref())?;
-    let min_games = query.min_games.unwrap_or(20).max(1);
-    let mut pairs: Vec<MatchupDto> = pair_rows(&state, period)
-        .await?
-        .into_iter()
-        .filter(|p| p.games >= min_games)
-        .map(|p| MatchupDto {
-            a: p.hero_lo,
-            b: p.hero_hi,
-            games: p.games,
-            a_wins: p.lo_wins,
-            a_win_rate: (p.lo_wins as f64 + 1.0) / (p.games as f64 + 2.0),
-        })
-        .collect();
-    pairs.sort_by_key(|p| std::cmp::Reverse(p.games));
-    pairs.truncate(5_000);
-    Ok(Json(MatchupsResponse {
-        period: period.as_str(),
-        pairs,
-    }))
-}
-
 async fn pair_rows(state: &AppState, period: Period) -> Result<Vec<PairRow>, ApiError> {
     if let Some(cached) = state.cache.read().await.get(&period)
         && cached.at.elapsed() < PAIR_CACHE_TTL
@@ -689,92 +641,6 @@ async fn hero_meta(ch: &ClickHouse) -> HashMap<u16, HeroMeta> {
         }
     }
     heroes
-}
-
-#[derive(Serialize)]
-struct MatchesResponse {
-    matches: Vec<MatchDto>,
-}
-
-#[derive(Serialize)]
-struct MatchDto {
-    match_id: String,
-    start_time: u32,
-    duration: u32,
-    radiant_win: bool,
-    radiant_score: u16,
-    dire_score: u16,
-    avg_rank_tier: u16,
-    radiant_heroes: Vec<MatchHero>,
-    dire_heroes: Vec<MatchHero>,
-}
-
-#[derive(Serialize)]
-struct MatchHero {
-    hero_id: u16,
-    localized_name: String,
-    icon: String,
-    icon_url: String,
-}
-
-#[derive(Deserialize)]
-struct MatchRow {
-    match_id: u64,
-    start_time: u32,
-    duration: u32,
-    radiant_win: bool,
-    radiant_score: u16,
-    dire_score: u16,
-    avg_rank_tier: u16,
-    radiant_heroes: Vec<u16>,
-    dire_heroes: Vec<u16>,
-}
-
-async fn recent_matches(
-    State(state): State<AppState>,
-    Query(query): Query<MatchesQuery>,
-) -> Result<Json<MatchesResponse>, ApiError> {
-    let limit = query.limit.unwrap_or(30).clamp(1, 200);
-    let rows: Vec<MatchRow> = state
-        .ch
-        .query(&format!(
-            "SELECT match_id, start_time, duration, radiant_win, radiant_score,
-                    dire_score, avg_rank_tier, radiant_heroes, dire_heroes
-             FROM {}
-             ORDER BY start_time DESC LIMIT {limit}",
-            state.ch.table("matches")
-        ))
-        .await
-        .map_err(ApiError::internal)?;
-    let meta = hero_meta(&state.ch).await;
-    let to_hero = |id: u16| {
-        let meta = meta.get(&id);
-        let icon = meta.map(|m| m.icon.clone()).unwrap_or_default();
-        MatchHero {
-            hero_id: id,
-            localized_name: meta
-                .map(|m| m.localized_name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| format!("#{id}")),
-            icon_url: icon_url(&icon),
-            icon,
-        }
-    };
-    let matches = rows
-        .into_iter()
-        .map(|row| MatchDto {
-            match_id: row.match_id.to_string(),
-            start_time: row.start_time,
-            duration: row.duration,
-            radiant_win: row.radiant_win,
-            radiant_score: row.radiant_score,
-            dire_score: row.dire_score,
-            avg_rank_tier: row.avg_rank_tier,
-            radiant_heroes: row.radiant_heroes.into_iter().map(to_hero).collect(),
-            dire_heroes: row.dire_heroes.into_iter().map(to_hero).collect(),
-        })
-        .collect();
-    Ok(Json(MatchesResponse { matches }))
 }
 
 fn parse_period(value: Option<&str>) -> Result<Period, ApiError> {

@@ -48,8 +48,8 @@ P(hero_a beats hero_b) = sigmoid(r_a - r_b + gamma * radiant_side)
   so ratings never mix patches. Snapshots are labelled with
   `TRUESIGHT_PATCH_NAME`.
 
-Matchup counters and the draft-oriented "beats / loses to" lists are derived
-from the same hourly aggregate table with Beta(1,1) smoothing.
+The hero detail modal shows raw matchup counters and the "beats / loses to"
+lists, derived from the same hourly aggregate table with Beta(1,1) smoothing.
 
 ## Quick start (Nix)
 
@@ -164,11 +164,10 @@ systemd credentials, and applies systemd hardening. The ClickHouse data lives in
 | `GET /api/health` | Uptime, checkpoint, stored match count, snapshot times |
 | `GET /api/heroes?period=day\|week\|month` | Latest hero leaderboard |
 | `GET /api/heroes/{hero_id}?period=…&min_games=20` | Hero detail, history, counters |
-| `GET /api/matchups?period=…&min_games=20` | Cross-hero pair win rates |
-| `GET /api/matches?limit=30` | Recent stored matches |
 
 The frontend is embedded in the binary (`assets/`), so no Node build step or
-static file deployment is required. Hero objects include `localized_name`,
+static file deployment is required. The UI is a single leaderboard with search,
+day/week/month switching, and a hero detail modal. Hero objects include `localized_name`,
 `icon`, `icon_url`, `primary_attr`, `attack_type`, and `roles`, loaded from
 Steam's `IEconDOTA2_570/GetHeroes` endpoint. Hero metadata is refreshed even
 when the match collector is disabled, as long as Steam keys are configured.
