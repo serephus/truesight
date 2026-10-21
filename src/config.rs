@@ -38,17 +38,11 @@ pub struct SteamConfig {
 #[derive(Debug, Clone)]
 pub struct CollectorConfig {
     pub enabled: bool,
-    /// Initial polling interval. The collector adapts this at runtime.
+    /// Initial polling interval; used to derive the initial MPM estimate.
     pub poll_interval: Duration,
+    /// Safety clamps for the adaptive interval.
     pub min_poll_interval: Duration,
     pub max_poll_interval: Duration,
-    pub poll_step: Duration,
-    /// Hard ceiling for acceptable lag; exceeding it forces catch-up.
-    pub max_lag: Duration,
-    /// "Caught up" threshold; below it the collector slows down.
-    pub min_lag: Duration,
-    /// Lag change over the smoothed trend that triggers an adjustment.
-    pub lag_trend_threshold: Duration,
     pub batch_size: u32,
     pub start_seq: Option<u64>,
 }
@@ -127,16 +121,6 @@ impl Config {
         let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 5000))
             .max(min_poll_interval)
             .min(max_poll_interval);
-        let poll_step = Duration::from_millis(env_u64("TRUESIGHT_POLL_STEP_MS", 500))
-            .max(Duration::from_millis(1));
-        let max_lag = Duration::from_secs(env_u64("TRUESIGHT_MAX_LAG_SECS", 3600));
-        let min_lag = Duration::from_secs(env_u64("TRUESIGHT_MIN_LAG_SECS", 300));
-        if min_lag > max_lag {
-            bail!("TRUESIGHT_MIN_LAG_SECS must be <= TRUESIGHT_MAX_LAG_SECS");
-        }
-        let lag_trend_threshold =
-            Duration::from_secs(env_u64("TRUESIGHT_LAG_TREND_THRESHOLD_SECS", 30));
-
         let patch_start = env_string("TRUESIGHT_PATCH_START")
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0);
@@ -157,10 +141,6 @@ impl Config {
                 poll_interval,
                 min_poll_interval,
                 max_poll_interval,
-                poll_step,
-                max_lag,
-                min_lag,
-                lag_trend_threshold,
                 batch_size,
                 start_seq: env_string("TRUESIGHT_START_SEQ").and_then(|v| v.parse().ok()),
             },

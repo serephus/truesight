@@ -27,26 +27,34 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
   429/5xx/invalid-key responses.
 
-The collector keeps lag bounded without targeting a fixed lag. Lag is measured
-from the newest processed match end time (`start_time + duration`) to now.
+The collector uses the MPM/distance rate matcher from `dota2-match-subscriber`.
+The initial rate is derived from the starting interval and batch size:
 
-- **Lag above the ceiling** (`TRUESIGHT_MAX_LAG_SECS`, default 1h): speed up
-  multiplicatively (`×0.7`) toward the minimum interval. This is the safety
-  guarantee against accumulating days of backlog.
-- **Lag below the caught-up floor** (`TRUESIGHT_MIN_LAG_SECS`, default 5min):
-  slow down by one step toward the maximum.
-- **Inside the band**: react to the smoothed lag trend. If lag is growing,
-  speed up; if it is shrinking, slow down; if it is stable, hold the current
-  interval.
-- **Empty batch**: slow down; there is nothing to fetch right now.
-- **Fetch/storage errors, 429s, non-advancing batches**: multiply the interval
-  by `2` up to the maximum, on top of per-key cooldown handling.
+```text
+target = batch_size - 1
+mpm    = target * 60_000 / initial_interval_ms
+```
 
-There is no target lag. The collector holds wherever the lag stabilises inside
-the acceptable band, so it does not deliberately fall back to one hour and does
-not let lag grow without bound. The initial interval is
-`TRUESIGHT_POLL_INTERVAL_MS`; the floor and ceiling are
-`TRUESIGHT_MIN_POLL_INTERVAL_MS` and `TRUESIGHT_MAX_POLL_INTERVAL_MS`.
+Each request is scheduled on a fixed deadline:
+
+```text
+interval_ms = target * 60_000 / (mpm + distance * 5)
+```
+
+- An almost-full batch (`> batch_size - 4`) means the collector is behind:
+  `mpm += 5`, and `distance` grows by `mpm * interval_ms / 60_000 / 20`.
+- A partial batch means it is ahead of or near the stream:
+  `mpm -= 5`, and `distance = len - batch_size`.
+- Requests use `sleep_until(deadline)`, so a slow batch is followed immediately
+  by the next request until the schedule catches up.
+- The computed interval is clamped to
+  `TRUESIGHT_MIN_POLL_INTERVAL_MS`–`TRUESIGHT_MAX_POLL_INTERVAL_MS`.
+- Empty batches use the partial-batch slow-down path.
+- Errors use a conservative backoff (5s, 10s, 20s, 40s, then 60s) instead of
+  speeding up; per-key Steam cooldowns still apply.
+
+With the default `5000ms` interval and batch size `100`, the initial MPM is
+`1188`; it adapts to the observed stream rate.
 
 ## Rating model
 
@@ -111,13 +119,9 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_STEAM_API_KEYS_FILE` | — | File containing keys |
 | `TRUESIGHT_STEAM_BASE_URL` | `https://api.steampowered.com` | Override for tests |
 | `TRUESIGHT_COLLECTOR_ENABLED` | `true` | Toggle ingestion |
-| `TRUESIGHT_POLL_INTERVAL_MS` | `5000` | Initial poll delay; adapts at runtime |
-| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Fastest poll interval when behind |
-| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest poll interval when caught up/backing off |
-| `TRUESIGHT_POLL_STEP_MS` | `500` | Additive slowdown step when too fresh |
-| `TRUESIGHT_MAX_LAG_SECS` | `3600` | Hard lag ceiling; exceeding it forces catch-up |
-| `TRUESIGHT_MIN_LAG_SECS` | `300` | Caught-up floor; below it the collector slows down |
-| `TRUESIGHT_LAG_TREND_THRESHOLD_SECS` | `30` | Lag change that triggers a trend adjustment |
+| `TRUESIGHT_POLL_INTERVAL_MS` | `5000` | Initial interval; used to derive the initial MPM |
+| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Minimum interval clamp |
+| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Maximum interval clamp |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
 | `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |

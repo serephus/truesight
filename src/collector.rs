@@ -5,6 +5,7 @@ use crate::steam::SteamClient;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -13,126 +14,86 @@ struct StateValue {
     value: String,
 }
 
-const SPEEDUP_FACTOR: f64 = 0.70;
-const ERROR_BACKOFF_FACTOR: f64 = 2.0;
-const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(1);
-const LAG_SMOOTHING: f64 = 0.8;
+const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Keeps the processing lag bounded without targeting a fixed lag.
+/// Rate controller ported from dota2-match-subscriber.
 ///
-/// Lag is measured from the newest processed match end time
-/// (`start_time + duration`) to now.
-///
-/// - Above `max_lag`: speed up; this is the safety ceiling that prevents
-///   accumulating days of backlog.
-/// - Below `min_lag`: slow down; we are effectively caught up.
-/// - Inside the band: react to the lag trend. If lag is growing, speed up;
-///   if it is shrinking, slow down; if it is stable, hold the interval.
-/// - Empty batches slow down; errors back off multiplicatively.
-///
-/// The controller does not try to sit at a specific lag. It holds wherever
-/// the lag stabilises inside the acceptable band.
+/// It estimates the stream rate in matches per minute (`mpm`) and keeps a
+/// `distance` correction. Requests are scheduled on a fixed deadline; the
+/// target is roughly `batch_size - 1` matches per request.
 #[derive(Debug, Clone)]
-struct LagController {
-    current: Duration,
-    min: Duration,
-    max: Duration,
-    step: Duration,
-    max_lag: u64,
-    min_lag: u64,
-    trend_threshold: f64,
-    smoothed_lag: Option<f64>,
-    last_match_end: Option<u64>,
+struct MpmController {
+    mpm: i64,
+    distance: i64,
+    target: i64,
+    batch_size: usize,
+    min_interval: Duration,
+    max_interval: Duration,
 }
 
-impl LagController {
+impl MpmController {
     fn new(
-        initial: Duration,
-        min: Duration,
-        max: Duration,
-        step: Duration,
-        max_lag: Duration,
-        min_lag: Duration,
-        trend_threshold: Duration,
+        initial_interval: Duration,
+        min_interval: Duration,
+        max_interval: Duration,
+        batch_size: u32,
     ) -> Self {
-        let min = min.max(Duration::from_millis(1));
-        let max = max.max(min);
+        let min_interval = min_interval.max(Duration::from_millis(1));
+        let max_interval = max_interval.max(min_interval);
+        let batch_size = batch_size.max(2) as usize;
+        let target = (batch_size - 1) as i64;
+        let initial_ms = initial_interval.as_millis().max(1) as i64;
+        let mpm = (target * 60_000 / initial_ms).max(1);
         Self {
-            current: initial.max(min).min(max),
-            min,
-            max,
-            step: step.max(Duration::from_millis(1)),
-            max_lag: max_lag.as_secs(),
-            min_lag: min_lag.as_secs(),
-            trend_threshold: trend_threshold.as_secs_f64(),
-            smoothed_lag: None,
-            last_match_end: None,
+            mpm,
+            distance: 0,
+            target,
+            batch_size,
+            min_interval,
+            max_interval,
         }
     }
 
-    fn on_batch(&mut self, newest_match_end: Option<u64>, now: u64) {
-        if let Some(end) = newest_match_end {
-            self.last_match_end = Some(self.last_match_end.map_or(end, |old| old.max(end)));
+    fn interval(&self) -> Duration {
+        let rate = (self.mpm + self.distance * 5).max(1);
+        let ms = (self.target * 60_000 / rate).max(1) as u64;
+        Duration::from_millis(ms)
+            .max(self.min_interval)
+            .min(self.max_interval)
+    }
+
+    fn initial_delay(&self) -> Duration {
+        self.interval()
+    }
+
+    fn on_batch(&mut self, fetched: usize, interval: Duration) {
+        let interval_ms = interval.as_millis() as i64;
+        let full_threshold = self.batch_size.saturating_sub(4);
+        if fetched > full_threshold {
+            self.mpm += 5;
+            self.distance = self.distance.max(0) + self.mpm * interval_ms / 60_000 / 20;
+        } else {
+            self.mpm -= 5;
+            self.distance = fetched as i64 - self.batch_size as i64;
         }
-        let Some(lag) = self.lag(now) else {
-            return;
-        };
-
-        let lag_value = lag as f64;
-        let trend = match self.smoothed_lag {
-            None => {
-                self.smoothed_lag = Some(lag_value);
-                0.0
-            }
-            Some(previous) => {
-                let smoothed = LAG_SMOOTHING * previous + (1.0 - LAG_SMOOTHING) * lag_value;
-                self.smoothed_lag = Some(smoothed);
-                lag_value - smoothed
-            }
-        };
-
-        if lag > self.max_lag {
-            self.speed_up();
-        } else if lag < self.min_lag {
-            self.slow_down();
-        } else if trend > self.trend_threshold {
-            self.speed_up();
-        } else if trend < -self.trend_threshold {
-            self.slow_down();
-        }
+        self.mpm = self.mpm.max(1);
     }
 
-    fn on_empty(&mut self) {
-        self.slow_down();
+    fn mpm(&self) -> i64 {
+        self.mpm
     }
 
-    fn on_error(&mut self) {
-        let backoff = self
-            .current
-            .mul_f64(ERROR_BACKOFF_FACTOR)
-            .max(MIN_ERROR_BACKOFF);
-        self.current = backoff.min(self.max).max(self.min);
+    fn distance(&self) -> i64 {
+        self.distance
     }
+}
 
-    fn lag(&self, now: u64) -> Option<u64> {
-        self.last_match_end.map(|end| now.saturating_sub(end))
-    }
-
-    fn max_lag_secs(&self) -> u64 {
-        self.max_lag
-    }
-
-    fn speed_up(&mut self) {
-        self.current = self.current.mul_f64(SPEEDUP_FACTOR).max(self.min);
-    }
-
-    fn slow_down(&mut self) {
-        self.current = (self.current + self.step).min(self.max);
-    }
-
-    fn delay(&self) -> Duration {
-        self.current
-    }
+fn error_backoff(consecutive_errors: u32) -> Duration {
+    let seconds = MIN_ERROR_BACKOFF
+        .as_secs()
+        .saturating_mul(1u64 << consecutive_errors.min(4));
+    Duration::from_secs(seconds.min(MAX_ERROR_BACKOFF.as_secs()))
 }
 
 pub async fn run(
@@ -170,57 +131,71 @@ pub async fn run(
         }
     };
 
-    let mut rate = LagController::new(
+    let mut controller = MpmController::new(
         cfg.poll_interval,
         cfg.min_poll_interval,
         cfg.max_poll_interval,
-        cfg.poll_step,
-        cfg.max_lag,
-        cfg.min_lag,
-        cfg.lag_trend_threshold,
+        cfg.batch_size,
     );
+    let mut consecutive_errors = 0u32;
+    let mut deadline = Instant::now();
+
+    info!(
+        cursor,
+        mpm = controller.mpm(),
+        interval_ms = controller.initial_delay().as_millis(),
+        "collector rate initialized"
+    );
+    if !sleep_or_cancel(&ct, controller.initial_delay()).await {
+        info!(cursor, "collector stopped");
+        return Ok(());
+    }
 
     loop {
         if ct.is_cancelled() {
             break;
         }
 
+        let interval = controller.interval();
+        deadline += interval;
+
         match steam
             .fetch_by_sequence(cursor.saturating_add(1), cfg.batch_size)
             .await
         {
             Ok(matches) if matches.is_empty() => {
-                rate.on_empty();
-                let now = now_secs();
+                controller.on_batch(0, interval);
+                consecutive_errors = 0;
                 debug!(
                     cursor,
-                    interval_ms = rate.delay().as_millis(),
-                    lag_secs = rate.lag(now).unwrap_or(0),
-                    max_lag_secs = rate.max_lag_secs(),
+                    fetched = 0,
+                    interval_ms = interval.as_millis(),
+                    mpm = controller.mpm(),
+                    distance = controller.distance(),
                     "no new matches from the steam sequence stream"
                 );
-                if !sleep_or_cancel(&ct, rate.delay()).await {
+                if !sleep_until_or_cancel(&ct, deadline).await {
                     break;
                 }
             }
             Ok(matches) => {
-                let newest_end = newest_match_end(&matches);
                 let batch_end = matches
                     .iter()
                     .filter_map(|m| m.get("match_seq_num").and_then(|v| v.as_u64()))
                     .max()
                     .unwrap_or(cursor);
                 if batch_end <= cursor {
-                    rate.on_error();
                     warn!(
                         cursor,
                         batch_end,
-                        interval_ms = rate.delay().as_millis(),
+                        mpm = controller.mpm(),
+                        distance = controller.distance(),
                         "Steam returned a non-advancing sequence batch; backing off"
                     );
-                    if !sleep_or_cancel(&ct, rate.delay()).await {
+                    if !error_wait(&ct, &mut consecutive_errors).await {
                         break;
                     }
+                    deadline = Instant::now();
                     continue;
                 }
 
@@ -228,61 +203,64 @@ pub async fn run(
                 let (stored, rated) = match store_batch(&ch, &matches, &token).await {
                     Ok(result) => result,
                     Err(error) => {
-                        rate.on_error();
                         warn!(
                             %error,
                             token,
-                            interval_ms = rate.delay().as_millis(),
+                            mpm = controller.mpm(),
+                            distance = controller.distance(),
                             "failed to store batch, will retry"
                         );
-                        if !sleep_or_cancel(&ct, rate.delay()).await {
+                        if !error_wait(&ct, &mut consecutive_errors).await {
                             break;
                         }
+                        deadline = Instant::now();
                         continue;
                     }
                 };
 
                 cursor = batch_end.max(cursor);
                 if let Err(error) = save_cursor(&ch, cursor).await {
-                    rate.on_error();
                     warn!(
                         %error,
                         cursor,
-                        interval_ms = rate.delay().as_millis(),
+                        mpm = controller.mpm(),
+                        distance = controller.distance(),
                         "failed to save collector checkpoint, will retry"
                     );
-                    if !sleep_or_cancel(&ct, rate.delay()).await {
+                    if !error_wait(&ct, &mut consecutive_errors).await {
                         break;
                     }
+                    deadline = Instant::now();
                     continue;
                 }
 
-                let now = now_secs();
-                rate.on_batch(newest_end, now);
+                controller.on_batch(matches.len(), interval);
+                consecutive_errors = 0;
                 debug!(
                     cursor,
                     fetched = matches.len(),
                     stored,
                     rated,
-                    interval_ms = rate.delay().as_millis(),
-                    lag_secs = rate.lag(now).unwrap_or(0),
-                    max_lag_secs = rate.max_lag_secs(),
+                    interval_ms = interval.as_millis(),
+                    mpm = controller.mpm(),
+                    distance = controller.distance(),
                     "stored sequence batch"
                 );
-                if !sleep_or_cancel(&ct, rate.delay()).await {
+                if !sleep_until_or_cancel(&ct, deadline).await {
                     break;
                 }
             }
             Err(error) => {
-                rate.on_error();
                 warn!(
                     %error,
-                    interval_ms = rate.delay().as_millis(),
+                    mpm = controller.mpm(),
+                    distance = controller.distance(),
                     "steam fetch failed; backing off"
                 );
-                if !sleep_or_cancel(&ct, rate.delay()).await {
+                if !error_wait(&ct, &mut consecutive_errors).await {
                     break;
                 }
+                deadline = Instant::now();
             }
         }
     }
@@ -290,6 +268,7 @@ pub async fn run(
     info!(cursor, "collector stopped");
     Ok(())
 }
+
 async fn store_batch(
     ch: &ClickHouse,
     values: &[serde_json::Value],
@@ -369,25 +348,10 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn newest_match_end(matches: &[serde_json::Value]) -> Option<u64> {
-    matches
-        .iter()
-        .filter_map(|m| {
-            let start = m
-                .get("start_time")
-                .and_then(|v| v.as_u64())
-                .filter(|v| *v > 0)?;
-            let duration = m.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
-            Some(start.saturating_add(duration))
-        })
-        .max()
+async fn error_wait(ct: &CancellationToken, consecutive_errors: &mut u32) -> bool {
+    let delay = error_backoff(*consecutive_errors);
+    *consecutive_errors = consecutive_errors.saturating_add(1);
+    sleep_or_cancel(ct, delay).await
 }
 
 async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {
@@ -397,149 +361,126 @@ async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {
     }
 }
 
+async fn sleep_until_or_cancel(ct: &CancellationToken, deadline: Instant) -> bool {
+    tokio::select! {
+        _ = ct.cancelled() => false,
+        _ = tokio::time::sleep_until(deadline) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    const NOW: u64 = 1_800_000_000;
-
-    fn controller() -> LagController {
-        LagController::new(
-            Duration::from_secs(2),
-            Duration::from_millis(250),
+    fn controller() -> MpmController {
+        MpmController::new(
+            Duration::from_millis(5000),
+            Duration::from_millis(2000),
             Duration::from_secs(30),
-            Duration::from_millis(500),
-            Duration::from_secs(3600),
-            Duration::from_secs(300),
-            Duration::from_secs(30),
+            100,
         )
     }
 
-    fn observe(rate: &mut LagController, lag_secs: u64, now: u64) {
-        rate.on_batch(Some(now.saturating_sub(lag_secs)), now);
+    #[test]
+    fn derives_initial_mpm_from_interval() {
+        let controller = controller();
+        assert_eq!(controller.mpm(), 1188);
+        assert_eq!(controller.interval(), Duration::from_millis(5000));
     }
 
     #[test]
-    fn holds_inside_the_band_when_lag_is_stable() {
-        let mut rate = controller();
-        for index in 0..10 {
-            observe(&mut rate, 1200, NOW + index * 60);
+    fn full_batches_speed_up() {
+        let mut controller = controller();
+        let initial = controller.interval();
+        for _ in 0..50 {
+            let interval = controller.interval();
+            controller.on_batch(100, interval);
         }
-        assert_eq!(rate.delay(), Duration::from_secs(2));
+        assert!(controller.interval() < initial);
     }
 
     #[test]
-    fn speeds_up_when_lag_grows() {
-        let mut rate = controller();
-        for index in 1..=20 {
-            observe(&mut rate, 1200 + index * 60, NOW + index * 60);
-        }
-        assert_eq!(rate.delay(), Duration::from_millis(250));
-    }
-
-    #[test]
-    fn slows_down_when_lag_shrinks() {
-        let mut rate = controller();
-        for index in 1..=20 {
-            observe(&mut rate, 1800 - index * 60, NOW + index * 60);
-        }
-        assert!(rate.delay() > Duration::from_secs(2));
-    }
-
-    #[test]
-    fn above_the_ceiling_speeds_up() {
-        let mut rate = controller();
-        for index in 0..20 {
-            observe(&mut rate, 7200, NOW + index * 60);
-        }
-        assert_eq!(rate.delay(), Duration::from_millis(250));
-    }
-
-    #[test]
-    fn below_the_caught_up_floor_slows_down() {
-        let mut rate = controller();
-        for index in 0..100 {
-            observe(&mut rate, 60, NOW + index * 60);
-        }
-        assert_eq!(rate.delay(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn empty_batches_slow_down_to_max() {
-        let mut rate = controller();
+    fn partial_batches_slow_down() {
+        let mut controller = controller();
+        let initial = controller.interval();
         for _ in 0..100 {
-            rate.on_empty();
+            let interval = controller.interval();
+            controller.on_batch(50, interval);
         }
-        assert_eq!(rate.delay(), Duration::from_secs(30));
+        assert!(controller.interval() > initial);
     }
 
     #[test]
-    fn errors_back_off_and_cap_at_max() {
-        let mut rate = controller();
-        rate.on_error();
-        assert!(rate.delay() >= Duration::from_secs(1));
-        for _ in 0..20 {
-            rate.on_error();
+    fn empty_batches_slow_down() {
+        let mut controller = controller();
+        let initial = controller.interval();
+        for _ in 0..100 {
+            let interval = controller.interval();
+            controller.on_batch(0, interval);
         }
-        assert_eq!(rate.delay(), Duration::from_secs(30));
+        assert!(controller.interval() > initial);
     }
 
     #[test]
-    fn behind_speeds_up_after_errors() {
-        let mut rate = controller();
-        for _ in 0..10 {
-            rate.on_error();
-        }
-        let before = rate.delay();
-        observe(&mut rate, 7200, NOW);
-        assert!(rate.delay() < before);
+    fn full_batch_increases_mpm() {
+        let mut controller = controller();
+        let before = controller.mpm();
+        let interval = controller.interval();
+        controller.on_batch(100, interval);
+        assert!(controller.mpm() > before);
+    }
+
+    #[test]
+    fn partial_batch_sets_negative_distance() {
+        let mut controller = controller();
+        let interval = controller.interval();
+        controller.on_batch(50, interval);
+        assert!(controller.distance() < 0);
     }
 
     #[test]
     fn initial_interval_is_clamped() {
         let max = Duration::from_secs(30);
         assert_eq!(
-            LagController::new(
+            MpmController::new(
                 Duration::from_secs(100),
-                Duration::from_millis(250),
+                Duration::from_millis(2000),
                 max,
-                Duration::from_millis(500),
-                Duration::from_secs(3600),
-                Duration::from_secs(300),
-                Duration::from_secs(30),
+                100,
             )
-            .delay(),
+            .interval(),
             max
         );
         assert_eq!(
-            LagController::new(
+            MpmController::new(
                 Duration::from_millis(1),
-                Duration::from_millis(250),
+                Duration::from_millis(2000),
                 max,
-                Duration::from_millis(500),
-                Duration::from_secs(3600),
-                Duration::from_secs(300),
-                Duration::from_secs(30),
+                100,
             )
-            .delay(),
-            Duration::from_millis(250)
+            .interval(),
+            Duration::from_millis(2000)
         );
     }
 
     #[test]
-    fn lag_uses_the_newest_match_end_time() {
-        let matches = vec![
-            json!({ "start_time": 1000, "duration": 500 }),
-            json!({ "start_time": 2000, "duration": 100 }),
-            json!({ "start_time": 2500 }),
-        ];
-        assert_eq!(newest_match_end(&matches), Some(2500));
+    fn error_backoff_increases_and_caps() {
+        assert_eq!(error_backoff(0), Duration::from_secs(5));
+        assert_eq!(error_backoff(1), Duration::from_secs(10));
+        assert_eq!(error_backoff(2), Duration::from_secs(20));
+        assert_eq!(error_backoff(3), Duration::from_secs(40));
+        assert_eq!(error_backoff(4), Duration::from_secs(60));
+        assert_eq!(error_backoff(10), Duration::from_secs(60));
     }
 
     #[test]
-    fn ignores_matches_without_start_time() {
-        let matches = vec![json!({ "duration": 500 }), json!({ "start_time": 0 })];
-        assert_eq!(newest_match_end(&matches), None);
+    fn one_match_batches_use_a_safe_minimum() {
+        let controller = MpmController::new(
+            Duration::from_millis(5000),
+            Duration::from_millis(2000),
+            Duration::from_secs(30),
+            1,
+        );
+        assert_eq!(controller.interval(), Duration::from_millis(5000));
     }
 }
