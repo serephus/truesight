@@ -75,37 +75,17 @@ in
       pollIntervalMs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 5000;
-        description = "Initial polling interval; the collector adapts between the min and max values.";
+        description = "Initial polling interval; used to derive the initial MPM estimate.";
       };
       minPollIntervalMs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 2000;
-        description = "Fastest polling interval when the collector is behind.";
+        description = "Minimum interval clamp for the adaptive collector.";
       };
       maxPollIntervalMs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 30000;
-        description = "Slowest polling interval when caught up or backing off after errors.";
-      };
-      pollStepMs = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 500;
-        description = "Additive step used when slowing down near the head.";
-      };
-      maxLagSeconds = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 3600;
-        description = "Hard lag ceiling; above this the collector speeds up.";
-      };
-      minLagSeconds = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 300;
-        description = "Caught-up lag floor; below this the collector slows down.";
-      };
-      lagTrendThresholdSeconds = lib.mkOption {
-        type = lib.types.ints.unsigned;
-        default = 30;
-        description = "Lag change that triggers a trend-based interval adjustment.";
+        description = "Maximum interval clamp for the adaptive collector.";
       };
       batchSize = lib.mkOption {
         type = lib.types.ints.between 1 100;
@@ -243,10 +223,6 @@ in
         assertion = cfg.collector.minPollIntervalMs <= cfg.collector.maxPollIntervalMs;
         message = "services.truesight.collector.minPollIntervalMs must be <= maxPollIntervalMs";
       }
-      {
-        assertion = cfg.collector.minLagSeconds <= cfg.collector.maxLagSeconds;
-        message = "services.truesight.collector.minLagSeconds must be <= maxLagSeconds";
-      }
     ];
 
     users.users.${cfg.user} = {
@@ -304,10 +280,6 @@ in
             "TRUESIGHT_POLL_INTERVAL_MS=${toString cfg.collector.pollIntervalMs}"
             "TRUESIGHT_MIN_POLL_INTERVAL_MS=${toString cfg.collector.minPollIntervalMs}"
             "TRUESIGHT_MAX_POLL_INTERVAL_MS=${toString cfg.collector.maxPollIntervalMs}"
-            "TRUESIGHT_POLL_STEP_MS=${toString cfg.collector.pollStepMs}"
-            "TRUESIGHT_MAX_LAG_SECS=${toString cfg.collector.maxLagSeconds}"
-            "TRUESIGHT_MIN_LAG_SECS=${toString cfg.collector.minLagSeconds}"
-            "TRUESIGHT_LAG_TREND_THRESHOLD_SECS=${toString cfg.collector.lagTrendThresholdSeconds}"
             "TRUESIGHT_BATCH_SIZE=${toString cfg.collector.batchSize}"
             "TRUESIGHT_RANKER_ENABLED=${bool cfg.ranker.enable}"
             "TRUESIGHT_RANK_INTERVAL_SECS=${toString cfg.ranker.interval}"
