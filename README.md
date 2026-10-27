@@ -27,34 +27,34 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
   429/5xx/invalid-key responses.
 
-The collector uses the MPM/distance rate matcher from `dota2-match-subscriber`.
-The initial rate is derived from the starting interval and batch size:
+The collector tracks the live stream with `GetMatchHistory` and adapts its
+request rate to Valve's rate limit.
 
-```text
-target = batch_size - 1
-mpm    = target * 60_000 / initial_interval_ms
-```
+- Every ~30 s it fetches the newest public match sequence and estimates:
+  - `lag_matches = head_seq - cursor`
+  - the stream rate in matches/second from consecutive head samples
+  - `lag_seconds = lag_matches / stream_rate`
+- The request governor works in requests/second:
+  - initial rate = `1 / TRUESIGHT_POLL_INTERVAL_MS`
+  - floor = `1 / TRUESIGHT_MAX_POLL_INTERVAL_MS`
+  - ceiling = `1 / TRUESIGHT_MIN_POLL_INTERVAL_MS`
+- While behind (`head_seq > cursor`), it runs at the current rate ceiling.
+- When caught up, it slows to the observed stream rate divided by batch size.
+- On HTTP 429, it halves the current rate, lowers a durable ceiling to 80% of
+  the rate that triggered the 429, and enforces a 30 s cooldown.
+- After the cooldown, while still behind, the current rate probes upward by 5%
+  per successful batch, but only up to that durable ceiling.
+- After 5 minutes with no 429, the durable ceiling itself recovers by 1%; this
+  repeats every quiet 5-minute period, up to the interval-derived maximum.
+  Recovery is intentionally much slower than the backoff.
+- If no 429 has occurred, the ceiling is the interval-derived maximum.
+- It never issues requests faster than the current ceiling, and all Steam
+  requests (head + history) share the same gate.
+- Non-429 failures use a 5/10/20/40/60 s backoff; per-key cooldowns still apply.
 
-Each request is scheduled on a fixed deadline:
-
-```text
-interval_ms = target * 60_000 / (mpm + distance * 5)
-```
-
-- An almost-full batch (`> batch_size - 4`) means the collector is behind:
-  `mpm += 5`, and `distance` grows by `mpm * interval_ms / 60_000 / 20`.
-- A partial batch means it is ahead of or near the stream:
-  `mpm -= 5`, and `distance = len - batch_size`.
-- Requests use `sleep_until(deadline)`, so a slow batch is followed immediately
-  by the next request until the schedule catches up.
-- The computed interval is clamped to
-  `TRUESIGHT_MIN_POLL_INTERVAL_MS`–`TRUESIGHT_MAX_POLL_INTERVAL_MS`.
-- Empty batches use the partial-batch slow-down path.
-- Errors use a conservative backoff (5s, 10s, 20s, 40s, then 60s) instead of
-  speeding up; per-key Steam cooldowns still apply.
-
-With the default `5000ms` interval and batch size `100`, the initial MPM is
-`1188`; it adapts to the observed stream rate.
+The effective match rate is `request_rate * batch_size * 60` matches/minute.
+With the defaults (`5000ms`, batch `100`), the initial rate is 0.2 req/s
+(1,200 matches/min); the ceiling is 0.5 req/s (3,000 matches/min).
 
 ## Rating model
 
@@ -119,9 +119,9 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_STEAM_API_KEYS_FILE` | — | File containing keys |
 | `TRUESIGHT_STEAM_BASE_URL` | `https://api.steampowered.com` | Override for tests |
 | `TRUESIGHT_COLLECTOR_ENABLED` | `true` | Toggle ingestion |
-| `TRUESIGHT_POLL_INTERVAL_MS` | `5000` | Initial interval; used to derive the initial MPM |
-| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Minimum interval clamp |
-| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Maximum interval clamp |
+| `TRUESIGHT_POLL_INTERVAL_MS` | `5000` | Initial request interval; derives the initial rate |
+| `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Fastest interval; becomes the rate ceiling |
+| `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest interval; becomes the rate floor |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
 | `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |
