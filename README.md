@@ -59,7 +59,16 @@ With the defaults (`5000ms`, batch `100`), the initial rate is 0.2 req/s
 ## Rating model
 
 For each window (24h, 7d, 30d), Truesight fits a Bradley–Terry model over the 25
-cross-team hero pairs in every match:
+cross-team hero pairs in every match. Windows are anchored at the newest
+collected match's `start_time`, not wall-clock `now`:
+
+- the window is `[anchor - period, anchor]`
+- patch clipping is applied to the start
+- time decay is relative to `anchor`, so collector lag does not age the window
+- `computed_at` remains the time the snapshot was fitted
+
+This keeps a full day/week/month of collected data even while the collector is
+catching up, instead of leaving a partially empty window at the live edge.
 
 ```
 P(hero_a beats hero_b) = sigmoid(r_a - r_b + gamma * radiant_side)
