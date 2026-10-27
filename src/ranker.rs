@@ -39,6 +39,11 @@ struct MaxComputedAt {
     computed_at: u32,
 }
 
+#[derive(Deserialize)]
+struct LatestMatch {
+    start_time: u32,
+}
+
 #[derive(Serialize)]
 struct RatingRow {
     computed_at: u32,
@@ -79,10 +84,16 @@ pub async fn run(ch: ClickHouse, cfg: RankerConfig, ct: CancellationToken) -> Re
         tokio::select! {
             _ = ct.cancelled() => break,
             _ = interval.tick() => {
-                for period in Period::ALL {
-                    if let Err(error) = rank_period(&ch, &cfg, period).await {
-                        warn!(%error, period = period.as_str(), "ranking failed");
+                match latest_match_time(&ch).await {
+                    Ok(Some(anchor)) => {
+                        for period in Period::ALL {
+                            if let Err(error) = rank_period(&ch, &cfg, period, anchor).await {
+                                warn!(%error, period = period.as_str(), "ranking failed");
+                            }
+                        }
                     }
+                    Ok(None) => info!("no collected matches yet, skipping ranking"),
+                    Err(error) => warn!(%error, "failed to determine ranking anchor"),
                 }
             }
         }
@@ -91,19 +102,22 @@ pub async fn run(ch: ClickHouse, cfg: RankerConfig, ct: CancellationToken) -> Re
     Ok(())
 }
 
-async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Result<()> {
-    let now = now();
-    let mut window_start = now.saturating_sub(period.seconds());
-    if let Some(patch) = &cfg.patch {
-        window_start = window_start.max(patch.start);
-    }
-    if window_start >= now {
+async fn rank_period(
+    ch: &ClickHouse,
+    cfg: &RankerConfig,
+    period: Period,
+    anchor: u32,
+) -> Result<()> {
+    let now = now().max(anchor);
+    let Some((window_start, window_end)) =
+        window_bounds(period, anchor, cfg.patch.as_ref().map(|patch| patch.start))
+    else {
         info!(
             period = period.as_str(),
-            "no complete window yet, skipping ranking"
+            anchor, "no complete window yet, skipping ranking"
         );
         return Ok(());
-    }
+    };
 
     let patch = cfg
         .patch
@@ -111,9 +125,11 @@ async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Res
         .map(|p| p.name.clone())
         .unwrap_or_default();
     let since_hour = window_start / 3600 * 3600;
+    let end_hour = window_end / 3600 * 3600;
     let half_life_hours = (period.seconds() as f64 / 2.0) / 3600.0;
-    let weight =
-        format!("exp(-{LN_2} * (toInt64({now}) - toInt64(hour)) / 3600.0 / {half_life_hours})");
+    let weight = format!(
+        "exp(-{LN_2} * (toInt64({window_end}) - toInt64(hour)) / 3600.0 / {half_life_hours})"
+    );
 
     let pair_sql = format!(
         "SELECT hero_lo, hero_hi,
@@ -122,7 +138,7 @@ async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Res
             sum(lo_radiant_games * {weight}) AS w_lo_radiant_games,
             sum(lo_radiant_wins * {weight}) AS w_lo_radiant_wins
          FROM {}
-         WHERE hour >= {since_hour}
+         WHERE hour >= {since_hour} AND hour <= {end_hour}
          GROUP BY hero_lo, hero_hi",
         ch.table("hero_matchups_hourly")
     );
@@ -131,7 +147,7 @@ async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Res
             sum(games) AS games,
             sum(wins) AS wins
          FROM {}
-         WHERE hour >= {since_hour}
+         WHERE hour >= {since_hour} AND hour <= {end_hour}
          GROUP BY hero_id",
         ch.table("hero_stats_hourly")
     );
@@ -246,6 +262,8 @@ async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Res
     info!(
         period = period.as_str(),
         computed_at,
+        window_start,
+        window_end,
         matches = total_matches,
         heroes = rows.len(),
         radiant_advantage = fit.radiant_advantage,
@@ -254,6 +272,34 @@ async fn rank_period(ch: &ClickHouse, cfg: &RankerConfig, period: Period) -> Res
         "computed hero ratings"
     );
     Ok(())
+}
+
+fn window_bounds(period: Period, anchor: u32, patch_start: Option<u32>) -> Option<(u32, u32)> {
+    if anchor == 0 {
+        return None;
+    }
+    let mut start = anchor.saturating_sub(period.seconds());
+    if let Some(patch_start) = patch_start {
+        start = start.max(patch_start);
+    }
+    if start >= anchor {
+        None
+    } else {
+        Some((start, anchor))
+    }
+}
+
+async fn latest_match_time(ch: &ClickHouse) -> Result<Option<u32>> {
+    let rows: Vec<LatestMatch> = ch
+        .query(&format!(
+            "SELECT max(start_time) AS start_time FROM {}",
+            ch.table("matches")
+        ))
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| row.start_time)
+        .filter(|start_time| *start_time > 0))
 }
 
 async fn next_computed_at(ch: &ClickHouse, period: Period, now: u32) -> Result<u32> {
@@ -294,4 +340,40 @@ fn now() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn day_window_ends_at_the_anchor() {
+        let anchor = 1_800_000_000;
+        assert_eq!(
+            window_bounds(Period::Day, anchor, None),
+            Some((anchor - 86_400, anchor))
+        );
+    }
+
+    #[test]
+    fn patch_clips_the_window_start() {
+        let anchor = 1_800_000_000;
+        let patch_start = anchor - 3_600;
+        assert_eq!(
+            window_bounds(Period::Day, anchor, Some(patch_start)),
+            Some((patch_start, anchor))
+        );
+    }
+
+    #[test]
+    fn patch_at_or_after_the_anchor_skips_ranking() {
+        let anchor = 1_800_000_000;
+        assert_eq!(window_bounds(Period::Day, anchor, Some(anchor)), None);
+        assert_eq!(window_bounds(Period::Day, anchor, Some(anchor + 1)), None);
+    }
+
+    #[test]
+    fn empty_anchor_skips_ranking() {
+        assert_eq!(window_bounds(Period::Day, 0, None), None);
+    }
 }

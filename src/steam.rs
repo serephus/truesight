@@ -3,6 +3,7 @@ use crate::model::Hero;
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -16,6 +17,13 @@ pub struct SteamClient {
     http: Client,
     base_url: String,
     keys: Arc<Mutex<KeyPool>>,
+    rate_limits: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Head {
+    pub seq: u64,
+    pub start_time: u32,
 }
 
 struct KeyPool {
@@ -54,7 +62,12 @@ impl SteamClient {
                     .collect(),
                 cursor: 0,
             })),
+            rate_limits: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn rate_limit_events(&self) -> u64 {
+        self.rate_limits.load(Ordering::Relaxed)
     }
 
     /// Fetch up to `matches_requested` full match objects starting at a sequence number.
@@ -74,41 +87,28 @@ impl SteamClient {
         Ok(matches)
     }
 
+    /// Fetch the newest public match from GetMatchHistory.
+    pub async fn fetch_head(&self) -> Result<Head> {
+        let value = self
+            .get_json(LATEST_PATH, &[("matches_requested", "1".to_owned())])
+            .await?;
+        let result = api_result(&value)?;
+        let head = result
+            .get("matches")
+            .and_then(Value::as_array)
+            .and_then(|matches| matches.first())
+            .context("Steam head response is missing matches")?;
+        let seq = head
+            .get("match_seq_num")
+            .and_then(Value::as_u64)
+            .context("Steam head match is missing match_seq_num")?;
+        let start_time = head.get("start_time").and_then(Value::as_u64).unwrap_or(0) as u32;
+        Ok(Head { seq, start_time })
+    }
+
     /// Best-effort lookup of the newest public match sequence number.
     pub async fn fetch_latest_sequence(&self) -> Result<u64> {
-        let mut last_error = None;
-        for game_mode in [Some("22"), None] {
-            let mut params = vec![("matches_requested", "1".to_owned())];
-            if let Some(game_mode) = game_mode {
-                params.push(("game_mode", game_mode.to_owned()));
-            }
-            match self.get_json(LATEST_PATH, &params).await {
-                Ok(value) => match api_result(&value) {
-                    Ok(result) => {
-                        let seq = result
-                            .get("matches")
-                            .and_then(Value::as_array)
-                            .and_then(|matches| matches.first())
-                            .and_then(|m| m.get("match_seq_num"))
-                            .and_then(Value::as_u64);
-                        if let Some(seq) = seq {
-                            return Ok(seq);
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "Steam latest-sequence lookup failed");
-                        last_error = Some(error);
-                    }
-                },
-                Err(error) => {
-                    warn!(%error, "Steam latest-sequence request failed");
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            anyhow!("Steam did not return any public match; cannot determine startup sequence")
-        }))
+        Ok(self.fetch_head().await?.seq)
     }
 
     pub async fn fetch_heroes(&self) -> Result<Vec<Hero>> {
@@ -152,6 +152,9 @@ impl SteamClient {
                         match serde_json::from_str::<Value>(&text) {
                             Ok(value) => {
                                 if let Some(error) = api_error(&value) {
+                                    if error.to_ascii_lowercase().contains("too many") {
+                                        self.rate_limits.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     self.mark_failure(index, Duration::from_secs(30));
                                     last_error = Some(anyhow!("Steam API error: {error}"));
                                 } else {
@@ -175,6 +178,7 @@ impl SteamClient {
                             .and_then(|v| v.parse::<u64>().ok());
                         let cooldown = match status {
                             StatusCode::TOO_MANY_REQUESTS => {
+                                self.rate_limits.fetch_add(1, Ordering::Relaxed);
                                 Duration::from_secs(retry_after.unwrap_or(30).max(10))
                             }
                             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
