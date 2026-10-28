@@ -220,6 +220,8 @@ systemd credentials, and applies systemd hardening. The ClickHouse data lives in
 | `GET /api/heroes?period=day\|week\|month` | Latest hero leaderboard |
 | `GET /api/heroes/{hero_id}?period=…&min_games=20` | Hero detail, history, counters |
 
+Hero responses include the anchored `window_start` and `window_end` timestamps.
+
 The frontend is embedded in the binary (`assets/`), so no Node build step or
 static file deployment is required. The UI is a single leaderboard with search,
 day/week/month switching, and a hero detail modal. Hero objects include `localized_name`,

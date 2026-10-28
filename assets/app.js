@@ -18,6 +18,12 @@ const el = {
 
 const CDN = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
 
+function showDetail(detail) {
+  el.modalBody.innerHTML = detailHtml(detail);
+  el.modal.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -47,7 +53,7 @@ function deltaHtml(delta) {
 function formatTime(unix) {
   if (!unix) return "—";
   return new Date(unix * 1000).toLocaleString(undefined, {
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
   });
 }
 
@@ -84,17 +90,22 @@ async function loadHeroes() {
 function renderMeta(data) {
   const patch = data.patch ? `<span>Patch <b>${esc(data.patch)}</b></span>` : "";
   const adv = Number(data.radiant_advantage || 0);
+  const windowEnd = data.window_end || data.computed_at;
+  const windowRange = data.window_start && windowEnd
+    ? `<b>${formatTime(data.window_start)}</b> → <b>${formatTime(windowEnd)}</b>`
+    : "";
+  const periodLabel = state.period[0].toUpperCase() + state.period.slice(1);
   el.meta.innerHTML = [
     `<span>Computed <b>${formatTime(data.computed_at)}</b></span>`,
     `<span>Sample <b>${num(data.matches)}</b> matches</span>`,
     `<span>Radiant edge <b>${adv >= 0 ? "+" : ""}${adv.toFixed(0)}</b></span>`,
     patch,
-  ].join("");
+  ].filter(Boolean).join("");
   el.summary.innerHTML = [
-    `<span><b>${state.period[0].toUpperCase() + state.period.slice(1)}</b> window</span>`,
+    `<span><b>${periodLabel}</b> window${windowRange ? ` · ${windowRange}` : ""}</span>`,
     `<span>Ratings from Bradley–Terry over cross-team hero pairs</span>`,
     data.converged === false ? `<span class="delta-down">last fit did not fully converge</span>` : "",
-  ].join("");
+  ].filter(Boolean).join("");
 }
 
 function filteredHeroes() {
@@ -147,9 +158,7 @@ function renderLeaderboard() {
 async function openHero(heroId) {
   try {
     const detail = await api(`/api/heroes/${heroId}?period=${state.period}`);
-    el.modalBody.innerHTML = detailHtml(detail);
-    el.modal.hidden = false;
-    document.body.style.overflow = "hidden";
+    showDetail(detail);
   } catch (error) {
     showError(error);
   }
@@ -174,7 +183,9 @@ function detailHtml(detail) {
       <span><b>${num(hero.games)}</b> games</span>
       <span><b>${winRate.toFixed(1)}%</b> win rate</span>
       <span><b>${num(hero.wins)}</b> wins</span>
-      <span><b>${esc(state.period)}</b> window</span>
+      <span>${detail.window_start && detail.window_end
+        ? `<b>${formatTime(detail.window_start)} → ${formatTime(detail.window_end)}</b> window`
+        : `<b>${esc(state.period)}</b> window`}</span>
     </div>
     <h3 class="section">Rating history</h3>
     ${ratingChart(detail.history)}
