@@ -302,6 +302,7 @@ pub fn schema_statements(database: &str, raw_retention_days: u32) -> Vec<String>
                 period LowCardinality(String),
                 patch LowCardinality(String),
                 window_start UInt32,
+                window_end UInt32,
                 matches UInt64,
                 heroes UInt32,
                 radiant_advantage Float64,
@@ -313,6 +314,10 @@ pub fn schema_statements(database: &str, raw_retention_days: u32) -> Vec<String>
             ENGINE = MergeTree
             PARTITION BY toYYYYMM(toDateTime(computed_at))
             ORDER BY (period, computed_at)"
+        ),
+        format!(
+            "ALTER TABLE {database}.rating_models
+             ADD COLUMN IF NOT EXISTS window_end UInt32 DEFAULT 0"
         ),
     ]
 }
@@ -330,7 +335,7 @@ mod tests {
     #[test]
     fn schema_has_all_tables() {
         let statements = schema_statements("truesight", 0);
-        assert_eq!(statements.len(), 8);
+        assert_eq!(statements.len(), 9);
         let joined = statements.join("\n");
         for table in [
             "matches",

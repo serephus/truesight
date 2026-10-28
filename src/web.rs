@@ -211,6 +211,7 @@ struct HeroesResponse {
     computed_at: u32,
     patch: String,
     window_start: u32,
+    window_end: u32,
     matches: u64,
     converged: bool,
     radiant_advantage: f64,
@@ -282,6 +283,7 @@ struct ModelRow {
     computed_at: u32,
     patch: String,
     window_start: u32,
+    window_end: u32,
     matches: u64,
     converged: bool,
     radiant_advantage: f64,
@@ -316,6 +318,16 @@ async fn heroes(
         computed_at,
         patch: model.as_ref().map(|m| m.patch.clone()).unwrap_or_default(),
         window_start: model.as_ref().map(|m| m.window_start).unwrap_or(0),
+        window_end: model
+            .as_ref()
+            .map(|m| {
+                if m.window_end == 0 {
+                    m.computed_at
+                } else {
+                    m.window_end
+                }
+            })
+            .unwrap_or(computed_at),
         matches: model.as_ref().map(|m| m.matches).unwrap_or(0),
         converged: model.as_ref().map(|m| m.converged).unwrap_or(false),
         radiant_advantage: model.as_ref().map(|m| m.radiant_advantage).unwrap_or(0.0),
@@ -327,6 +339,8 @@ async fn heroes(
 struct HeroDetailResponse {
     period: &'static str,
     computed_at: u32,
+    window_start: u32,
+    window_end: u32,
     hero: HeroDto,
     history: Vec<HistoryPoint>,
     beats: Vec<Counter>,
@@ -402,6 +416,9 @@ async fn hero_detail(
         .next()
         .ok_or_else(|| ApiError::not_found("hero has no rating for this period"))?;
     let computed_at = hero.computed_at;
+    let model = latest_model(&state.ch, period)
+        .await
+        .map_err(ApiError::internal)?;
     let hero_dto = hero_dto(hero, meta.get(&hero_id));
 
     let history: Vec<HistoryPoint> = state
@@ -487,6 +504,17 @@ async fn hero_detail(
     Ok(Json(HeroDetailResponse {
         period: period.as_str(),
         computed_at,
+        window_start: model.as_ref().map(|m| m.window_start).unwrap_or(0),
+        window_end: model
+            .as_ref()
+            .map(|m| {
+                if m.window_end == 0 {
+                    m.computed_at
+                } else {
+                    m.window_end
+                }
+            })
+            .unwrap_or(computed_at),
         hero: hero_dto,
         history,
         beats,
@@ -521,7 +549,7 @@ async fn latest_ratings(
 async fn latest_model(ch: &ClickHouse, period: Period) -> Result<Option<ModelRow>> {
     let rows: Vec<ModelRow> = ch
         .query(&format!(
-            "SELECT computed_at, patch, window_start, matches, converged, radiant_advantage
+            "SELECT computed_at, patch, window_start, window_end, matches, converged, radiant_advantage
              FROM {} WHERE period = {} ORDER BY computed_at DESC LIMIT 1",
             ch.table("rating_models"),
             quote_string(period.as_str())
