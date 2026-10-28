@@ -278,8 +278,12 @@ pub async fn run(
                     );
                 }
                 Err(error) => {
-                    head.seq = None;
-                    warn!(%error, limited, "failed to refresh steam head");
+                    warn!(
+                        %error,
+                        limited,
+                        last_known_seq = head.seq,
+                        "failed to refresh steam head; keeping the last known sequence"
+                    );
                 }
             }
             last_head_refresh = Some(now);
@@ -314,7 +318,12 @@ pub async fn run(
         match result {
             Ok(matches) if matches.is_empty() => {
                 consecutive_errors = 0;
-                governor.on_success(false, now);
+                governor.on_success(behind, now);
+                if behind {
+                    // A stale head can make us look behind while the stream is
+                    // already caught up. Back off slightly instead of spinning.
+                    gate.defer(MIN_ERROR_BACKOFF);
+                }
                 debug!(
                     cursor,
                     fetched = 0,

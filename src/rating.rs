@@ -149,7 +149,9 @@ pub fn fit(pairs: &[PairCounts], heroes: &[HeroCounts], options: FitOptions) -> 
             step *= 0.5;
         }
         if !accepted {
-            converged = true;
+            // The line search could not improve the posterior. This is a
+            // stalled optimization, not convergence.
+            converged = false;
             break;
         }
 

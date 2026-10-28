@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{
-    env, fs,
+    env, fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -17,9 +17,10 @@ pub struct Config {
     pub collector: CollectorConfig,
     pub ranker: RankerConfig,
     pub raw_retention_days: u32,
+    pub snapshot_retention_days: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
     pub database: String,
@@ -28,11 +29,33 @@ pub struct ClickHouseConfig {
     pub timeout: Duration,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickHouseConfig")
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct SteamConfig {
     pub keys: Vec<String>,
     pub base_url: String,
     pub timeout: Duration,
+}
+
+impl fmt::Debug for SteamConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamConfig")
+            .field("keys", &format!("<{} keys>", self.keys.len()))
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,11 +109,11 @@ impl Config {
                 "clickhouse_password",
             )?
             .unwrap_or_default(),
-            timeout: Duration::from_secs(env_u64("TRUESIGHT_CLICKHOUSE_TIMEOUT_SECS", 60)),
+            timeout: Duration::from_secs(env_u64("TRUESIGHT_CLICKHOUSE_TIMEOUT_SECS", 60)?),
         };
 
         let keys = read_keys()?;
-        let collector_enabled = env_bool("TRUESIGHT_COLLECTOR_ENABLED", true);
+        let collector_enabled = env_bool("TRUESIGHT_COLLECTOR_ENABLED", true)?;
         if collector_enabled && keys.is_empty() {
             bail!(
                 "no Steam API keys configured; set TRUESIGHT_STEAM_API_KEYS \
@@ -105,29 +128,47 @@ impl Config {
                 .unwrap_or_else(|| "https://api.steampowered.com".into())
                 .trim_end_matches('/')
                 .to_owned(),
-            timeout: Duration::from_secs(env_u64("TRUESIGHT_STEAM_TIMEOUT_SECS", 30)),
+            timeout: Duration::from_secs(env_u64("TRUESIGHT_STEAM_TIMEOUT_SECS", 30)?),
         };
 
-        let batch_size = env_u64("TRUESIGHT_BATCH_SIZE", 100).clamp(1, 100) as u32;
+        let batch_size = env_u64("TRUESIGHT_BATCH_SIZE", 100)?.clamp(1, 100) as u32;
         let min_poll_interval =
-            Duration::from_millis(env_u64("TRUESIGHT_MIN_POLL_INTERVAL_MS", 2000))
+            Duration::from_millis(env_u64("TRUESIGHT_MIN_POLL_INTERVAL_MS", 2000)?)
                 .max(Duration::from_millis(1));
         let max_poll_interval =
-            Duration::from_millis(env_u64("TRUESIGHT_MAX_POLL_INTERVAL_MS", 30_000))
+            Duration::from_millis(env_u64("TRUESIGHT_MAX_POLL_INTERVAL_MS", 30_000)?)
                 .max(Duration::from_millis(1));
         if min_poll_interval > max_poll_interval {
             bail!("TRUESIGHT_MIN_POLL_INTERVAL_MS must be <= TRUESIGHT_MAX_POLL_INTERVAL_MS");
         }
-        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 5000))
+        let poll_interval = Duration::from_millis(env_u64("TRUESIGHT_POLL_INTERVAL_MS", 5000)?)
             .max(min_poll_interval)
             .min(max_poll_interval);
         let patch_start = env_string("TRUESIGHT_PATCH_START")
-            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| {
+                v.parse::<u32>()
+                    .with_context(|| format!("invalid TRUESIGHT_PATCH_START: {v}"))
+            })
+            .transpose()?
             .filter(|v| *v > 0);
         let patch = patch_start.map(|start| Patch {
             name: env_string("TRUESIGHT_PATCH_NAME").unwrap_or_else(|| "current".into()),
             start,
         });
+        let lambda = match env_string("TRUESIGHT_REGULARIZATION") {
+            None => 1.0,
+            Some(value) => {
+                let value: f64 = value
+                    .parse()
+                    .with_context(|| format!("invalid TRUESIGHT_REGULARIZATION: {value}"))?;
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("TRUESIGHT_REGULARIZATION must be a finite positive number");
+                }
+                value
+            }
+        };
+        let raw_retention_days = env_u32("TRUESIGHT_RAW_RETENTION_DAYS", 0)?;
+        let snapshot_retention_days = env_u32("TRUESIGHT_SNAPSHOT_RETENTION_DAYS", 180)?;
 
         Ok(Self {
             bind,
@@ -142,19 +183,22 @@ impl Config {
                 min_poll_interval,
                 max_poll_interval,
                 batch_size,
-                start_seq: env_string("TRUESIGHT_START_SEQ").and_then(|v| v.parse().ok()),
+                start_seq: env_string("TRUESIGHT_START_SEQ")
+                    .map(|v| {
+                        v.parse::<u64>()
+                            .with_context(|| format!("invalid TRUESIGHT_START_SEQ: {v}"))
+                    })
+                    .transpose()?,
             },
             ranker: RankerConfig {
-                enabled: env_bool("TRUESIGHT_RANKER_ENABLED", true),
-                interval: Duration::from_secs(env_u64("TRUESIGHT_RANK_INTERVAL_SECS", 300)),
+                enabled: env_bool("TRUESIGHT_RANKER_ENABLED", true)?,
+                interval: Duration::from_secs(env_u64("TRUESIGHT_RANK_INTERVAL_SECS", 300)?),
                 patch,
-                lambda: env_string("TRUESIGHT_REGULARIZATION")
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .filter(|v| *v > 0.0)
-                    .unwrap_or(1.0),
-                min_games: env_u64("TRUESIGHT_MIN_RATED_GAMES", 1),
+                lambda,
+                min_games: env_u64("TRUESIGHT_MIN_RATED_GAMES", 1)?,
             },
-            raw_retention_days: env_u64("TRUESIGHT_RAW_RETENTION_DAYS", 0) as u32,
+            raw_retention_days,
+            snapshot_retention_days,
         })
     }
 }
@@ -227,16 +271,39 @@ fn env_string(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    env_string(name)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(default)
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    match env_string(name) {
+        None => Ok(default),
+        Some(value) => parse_bool(&value).with_context(|| {
+            format!("invalid {name}: expected one of 1/0, true/false, yes/no, on/off")
+        }),
+    }
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    env_string(name)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match env_string(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .with_context(|| format!("invalid {name}: expected a non-negative integer")),
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> Result<u32> {
+    match env_string(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .with_context(|| format!("invalid {name}: expected a non-negative integer")),
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +324,39 @@ mod tests {
         assert!(validate_identifier("a-b").is_err());
         assert!(validate_identifier("a.b").is_err());
         assert!(validate_identifier("").is_err());
+    }
+
+    #[test]
+    fn parses_boolean_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(parse_bool(value), Some(true));
+        }
+        for value in ["0", "false", "NO", "off"] {
+            assert_eq!(parse_bool(value), Some(false));
+        }
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let steam = SteamConfig {
+            keys: vec!["super-secret-key".into()],
+            base_url: "https://example.test".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let debug = format!("{steam:?}");
+        assert!(!debug.contains("super-secret-key"));
+        assert!(debug.contains("<1 keys>"));
+
+        let clickhouse = ClickHouseConfig {
+            url: "http://localhost:8123".into(),
+            database: "truesight".into(),
+            user: "default".into(),
+            password: "hunter2".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let debug = format!("{clickhouse:?}");
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

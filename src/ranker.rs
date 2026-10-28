@@ -44,6 +44,19 @@ struct LatestMatch {
     start_time: u32,
 }
 
+#[derive(Deserialize)]
+struct LatestIngest {
+    ingested_at: u32,
+}
+
+#[derive(Deserialize)]
+struct LatestModel {
+    computed_at: u32,
+    patch: String,
+    window_start: u32,
+    window_end: u32,
+}
+
 #[derive(Serialize)]
 struct RatingRow {
     computed_at: u32,
@@ -125,6 +138,21 @@ async fn rank_period(
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_default();
+    let previous_model = latest_model(ch, period).await?;
+    let latest_ingest = latest_ingest_time(ch).await?;
+    if let Some(previous) = previous_model.as_ref()
+        && snapshot_is_current(previous, &patch, window_start, window_end, latest_ingest)
+    {
+        info!(
+            period = period.as_str(),
+            computed_at = previous.computed_at,
+            window_start,
+            window_end,
+            "ratings are already current, skipping fit"
+        );
+        return Ok(());
+    }
+
     let since_hour = window_start / 3600 * 3600;
     let end_hour = window_end / 3600 * 3600;
     let half_life_hours = (period.seconds() as f64 / 2.0) / 3600.0;
@@ -233,7 +261,8 @@ async fn rank_period(
         .round()
         .max(0.0) as u64;
 
-    ch.insert("hero_ratings", &rows, None)
+    let token = format!("{}-{}-{computed_at}", period.as_str(), patch);
+    ch.insert("hero_ratings", &rows, Some(&format!("{token}-hr")))
         .await
         .context("failed to insert hero ratings")?;
     let model = ModelRow {
@@ -250,7 +279,7 @@ async fn rank_period(
         log_likelihood: fit.log_likelihood,
         lambda: options.lambda,
     };
-    ch.insert("rating_models", &[model], None)
+    ch.insert("rating_models", &[model], Some(&format!("{token}-rm")))
         .await
         .context("failed to insert rating model metadata")?;
 
@@ -302,6 +331,47 @@ async fn latest_match_time(ch: &ClickHouse) -> Result<Option<u32>> {
         .first()
         .map(|row| row.start_time)
         .filter(|start_time| *start_time > 0))
+}
+
+async fn latest_ingest_time(ch: &ClickHouse) -> Result<Option<u32>> {
+    let rows: Vec<LatestIngest> = ch
+        .query(&format!(
+            "SELECT max(ingested_at) AS ingested_at FROM {}",
+            ch.table("matches")
+        ))
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| row.ingested_at)
+        .filter(|ingested_at| *ingested_at > 0))
+}
+
+fn snapshot_is_current(
+    previous: &LatestModel,
+    patch: &str,
+    window_start: u32,
+    window_end: u32,
+    latest_ingest: Option<u32>,
+) -> bool {
+    previous.patch == patch
+        && previous.window_start == window_start
+        && previous.window_end == window_end
+        && latest_ingest.is_some_and(|ingested_at| ingested_at < previous.computed_at)
+}
+
+async fn latest_model(ch: &ClickHouse, period: Period) -> Result<Option<LatestModel>> {
+    let rows: Vec<LatestModel> = ch
+        .query(&format!(
+            "SELECT computed_at, patch, window_start, window_end
+             FROM {}
+             WHERE period = {}
+             ORDER BY computed_at DESC
+             LIMIT 1",
+            ch.table("rating_models"),
+            quote_string(period.as_str())
+        ))
+        .await?;
+    Ok(rows.into_iter().next())
 }
 
 async fn next_computed_at(ch: &ClickHouse, period: Period, now: u32) -> Result<u32> {
@@ -377,5 +447,44 @@ mod tests {
     #[test]
     fn empty_anchor_skips_ranking() {
         assert_eq!(window_bounds(Period::Day, 0, None), None);
+    }
+
+    #[test]
+    fn skips_only_unchanged_snapshots_without_new_data() {
+        let previous = LatestModel {
+            computed_at: 2_000,
+            patch: "7.40".into(),
+            window_start: 1_000,
+            window_end: 2_000,
+        };
+        assert!(snapshot_is_current(
+            &previous,
+            "7.40",
+            1_000,
+            2_000,
+            Some(1_999)
+        ));
+        assert!(!snapshot_is_current(
+            &previous,
+            "7.40",
+            1_000,
+            2_000,
+            Some(2_000)
+        ));
+        assert!(!snapshot_is_current(
+            &previous,
+            "7.41",
+            1_000,
+            2_000,
+            Some(1_999)
+        ));
+        assert!(!snapshot_is_current(
+            &previous,
+            "7.40",
+            1_001,
+            2_000,
+            Some(1_999)
+        ));
+        assert!(!snapshot_is_current(&previous, "7.40", 1_000, 2_000, None));
     }
 }

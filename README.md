@@ -82,6 +82,8 @@ P(hero_a beats hero_b) = sigmoid(r_a - r_b + gamma * radiant_side)
   approximation).
 - Each snapshot stores the previous rating and the delta, so the UI can show
   rising/falling heroes.
+- A period is skipped when the anchored window, patch, and latest ingestion time
+  are unchanged, so repeated ticks do not create flat duplicate snapshots.
 - If `TRUESIGHT_PATCH_START` is set, every window is clipped to that timestamp,
   so ratings never mix patches. Snapshots are labelled with
   `TRUESIGHT_PATCH_NAME`.
@@ -132,11 +134,14 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_MIN_POLL_INTERVAL_MS` | `2000` | Fastest interval; becomes the rate ceiling |
 | `TRUESIGHT_MAX_POLL_INTERVAL_MS` | `30000` | Slowest interval; becomes the rate floor |
 | `TRUESIGHT_BATCH_SIZE` | `100` | Matches per Steam call (max 100) |
-| `TRUESIGHT_START_SEQ` | latest | First-boot sequence override |
+| `TRUESIGHT_START_SEQ` | latest | First-boot sequence override; can be used to backfill |
 | `TRUESIGHT_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint |
 | `TRUESIGHT_CLICKHOUSE_DATABASE` | `truesight` | Database name |
 | `TRUESIGHT_CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `TRUESIGHT_CLICKHOUSE_PASSWORD` | empty | ClickHouse password |
+| `TRUESIGHT_CLICKHOUSE_PASSWORD_FILE` | — | File containing the ClickHouse password |
+| `TRUESIGHT_CLICKHOUSE_TIMEOUT_SECS` | `60` | ClickHouse HTTP timeout |
+| `TRUESIGHT_STEAM_TIMEOUT_SECS` | `30` | Steam HTTP timeout |
 | `TRUESIGHT_RANKER_ENABLED` | `true` | Toggle rating fits |
 | `TRUESIGHT_RANK_INTERVAL_SECS` | `300` | Seconds between fits |
 | `TRUESIGHT_REGULARIZATION` | `1.0` | L2 lambda |
@@ -144,6 +149,10 @@ Everything is environment-driven (no CLI flags).
 | `TRUESIGHT_PATCH_START` | unset | Unix timestamp of current patch |
 | `TRUESIGHT_PATCH_NAME` | `current` | Patch label |
 | `TRUESIGHT_RAW_RETENTION_DAYS` | `0` | Drop raw JSON column after N days; 0 = keep |
+| `TRUESIGHT_SNAPSHOT_RETENTION_DAYS` | `180` | Delete rating snapshots after N days; 0 = keep |
+
+Invalid numeric or boolean values are rejected at startup instead of silently
+falling back to defaults.
 
 Secrets can also be supplied through systemd credentials: if
 `$CREDENTIALS_DIRECTORY` exists, Truesight reads `steam_api_keys` and
@@ -193,6 +202,9 @@ The flake exports `nixosModules.default`:
             # Local managed ClickHouse (default). Set enable = false to use an
             # external instance and configure `clickhouse.url`.
             clickhouse.enable = true;
+
+            # Optional: keep rating snapshots for 180 days (0 = forever).
+            snapshotRetentionDays = 180;
 
             # Optional reverse proxy with TLS:
             # nginx.enable = true;
@@ -274,6 +286,8 @@ Inserts are idempotent for crash replay: each batch uses a deterministic
   framework yet. Recreate the database after incompatible schema changes.
 - `TRUESIGHT_RAW_RETENTION_DAYS` is applied when the `matches` table is created;
   changing it later does not retrofit a column TTL.
+- `TRUESIGHT_SNAPSHOT_RETENTION_DAYS` is applied when the rating tables are
+  created; existing tables are not modified automatically.
 
 ## Development
 

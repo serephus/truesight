@@ -4,7 +4,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "truesight";
-  version = "0.1.0";
+  version = (lib.importTOML ../Cargo.toml).package.version;
 
   src = lib.cleanSourceWith {
     src = ../.;
@@ -13,7 +13,11 @@ rustPlatform.buildRustPackage {
       let
         name = baseNameOf (toString path);
       in
-      name != "target" && name != ".clickhouse" && name != ".direnv";
+      name != "target"
+      && name != ".clickhouse"
+      && name != ".direnv"
+      && name != "example.json"
+      && name != "result";
   };
   cargoLock.lockFile = ../Cargo.lock;
 

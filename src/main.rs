@@ -11,7 +11,7 @@ mod redact;
 mod steam;
 mod web;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ch::ClickHouse;
 use config::Config;
 use std::time::Duration;
@@ -45,6 +45,8 @@ async fn main() -> Result<()> {
         database = %cfg.clickhouse.database,
         patch = cfg.ranker.patch.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
         keys = cfg.steam.keys.len(),
+        raw_retention_days = cfg.raw_retention_days,
+        snapshot_retention_days = cfg.snapshot_retention_days,
         "starting truesight"
     );
 
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
         &cfg.clickhouse.password,
         cfg.clickhouse.timeout,
     )?;
-    migrate_with_retry(&ch, cfg.raw_retention_days).await?;
+    migrate_with_retry(&ch, cfg.raw_retention_days, cfg.snapshot_retention_days).await?;
     if let Err(error) = heroes::seed_fallback(&ch).await {
         warn!(%error, "failed to seed hardcoded hero metadata; web will use the built-in fallback");
     }
@@ -95,35 +97,66 @@ async fn main() -> Result<()> {
         warn!("ranker disabled; ratings will not be refreshed");
     }
 
-    let state = web::AppState::new(ch, cfg.ranker.patch.as_ref().map(|p| p.start));
+    let state = web::AppState::new(ch);
     tasks.spawn(web::serve(state, cfg.bind, ct.clone()));
 
+    let mut failed = false;
     tokio::select! {
         _ = shutdown_signal() => info!("shutdown signal received"),
         joined = tasks.join_next() => {
             match joined {
-                Some(Ok(Err(error))) => error!(%error, "service task failed"),
-                Some(Err(error)) => error!(%error, "service task panicked"),
-                Some(Ok(Ok(()))) => warn!("service task exited unexpectedly"),
-                None => {}
+                Some(Ok(Err(error))) => {
+                    error!(%error, "service task failed");
+                    failed = true;
+                }
+                Some(Err(error)) => {
+                    error!(%error, "service task panicked");
+                    failed = true;
+                }
+                Some(Ok(Ok(()))) => {
+                    warn!("service task exited unexpectedly");
+                    failed = true;
+                }
+                None => {
+                    warn!("all service tasks exited unexpectedly");
+                    failed = true;
+                }
             }
         }
     }
 
     ct.cancel();
     while let Some(joined) = tasks.join_next().await {
-        if let Err(error) = joined {
-            warn!(%error, "task failed while shutting down");
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "task failed while shutting down");
+                failed = true;
+            }
+            Err(error) => {
+                warn!(%error, "task panicked while shutting down");
+                failed = true;
+            }
         }
     }
     info!("truesight stopped");
+    if failed {
+        bail!("one or more service tasks failed");
+    }
     Ok(())
 }
 
-async fn migrate_with_retry(ch: &ClickHouse, raw_retention_days: u32) -> Result<()> {
+async fn migrate_with_retry(
+    ch: &ClickHouse,
+    raw_retention_days: u32,
+    snapshot_retention_days: u32,
+) -> Result<()> {
     let mut last_error = None;
     for attempt in 1..=30 {
-        match ch.migrate(raw_retention_days).await {
+        match ch
+            .migrate(raw_retention_days, snapshot_retention_days)
+            .await
+        {
             Ok(()) => {
                 info!("ClickHouse schema is ready");
                 return Ok(());

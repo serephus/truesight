@@ -47,10 +47,16 @@ impl ClickHouse {
         format!("{}.{}", self.database, name)
     }
 
-    pub async fn migrate(&self, raw_retention_days: u32) -> Result<()> {
+    pub async fn migrate(
+        &self,
+        raw_retention_days: u32,
+        snapshot_retention_days: u32,
+    ) -> Result<()> {
         self.execute(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
             .await?;
-        for statement in schema_statements(&self.database, raw_retention_days) {
+        for statement in
+            schema_statements(&self.database, raw_retention_days, snapshot_retention_days)
+        {
             self.execute(&statement)
                 .await
                 .with_context(|| format!("failed to apply schema statement: {statement}"))?;
@@ -161,9 +167,18 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
-pub fn schema_statements(database: &str, raw_retention_days: u32) -> Vec<String> {
+pub fn schema_statements(
+    database: &str,
+    raw_retention_days: u32,
+    snapshot_retention_days: u32,
+) -> Vec<String> {
     let raw_ttl = if raw_retention_days > 0 {
         format!(" TTL toDateTime(start_time) + INTERVAL {raw_retention_days} DAY")
+    } else {
+        String::new()
+    };
+    let snapshot_ttl = if snapshot_retention_days > 0 {
+        format!(" TTL toDateTime(computed_at) + INTERVAL {snapshot_retention_days} DAY DELETE")
     } else {
         String::new()
     };
@@ -294,7 +309,7 @@ pub fn schema_statements(database: &str, raw_retention_days: u32) -> Vec<String>
             )
             ENGINE = MergeTree
             PARTITION BY toYYYYMM(toDateTime(computed_at))
-            ORDER BY (period, computed_at, hero_id)"
+            ORDER BY (period, computed_at, hero_id){snapshot_ttl}"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.rating_models (
@@ -313,7 +328,7 @@ pub fn schema_statements(database: &str, raw_retention_days: u32) -> Vec<String>
             )
             ENGINE = MergeTree
             PARTITION BY toYYYYMM(toDateTime(computed_at))
-            ORDER BY (period, computed_at)"
+            ORDER BY (period, computed_at){snapshot_ttl}"
         ),
         format!(
             "ALTER TABLE {database}.rating_models
@@ -334,7 +349,7 @@ mod tests {
 
     #[test]
     fn schema_has_all_tables() {
-        let statements = schema_statements("truesight", 0);
+        let statements = schema_statements("truesight", 0, 0);
         assert_eq!(statements.len(), 9);
         let joined = statements.join("\n");
         for table in [
@@ -354,7 +369,18 @@ mod tests {
 
     #[test]
     fn schema_applies_raw_ttl() {
-        let joined = schema_statements("truesight", 90).join("\n");
+        let joined = schema_statements("truesight", 90, 0).join("\n");
         assert!(joined.contains("TTL toDateTime(start_time) + INTERVAL 90 DAY"));
+    }
+
+    #[test]
+    fn schema_applies_snapshot_ttl() {
+        let joined = schema_statements("truesight", 0, 180).join("\n");
+        assert!(joined.contains("TTL toDateTime(computed_at) + INTERVAL 180 DAY DELETE"));
+        assert!(
+            !schema_statements("truesight", 0, 0)
+                .join("\n")
+                .contains("INTERVAL 180 DAY")
+        );
     }
 }

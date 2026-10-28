@@ -161,7 +161,8 @@ thead th {
 }
 tbody td { padding: 10px 14px; border-bottom: 1px solid rgba(36, 52, 71, .65); }
 tbody tr { cursor: pointer; transition: background .12s ease; }
-tbody tr:hover { background: rgba(94, 234, 212, .06); }
+tbody tr:hover, tbody tr:focus-visible { background: rgba(94, 234, 212, .06); }
+tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 tbody tr:last-child td { border-bottom: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .hero-cell { display: flex; align-items: center; gap: 10px; min-width: 210px; }

@@ -180,6 +180,15 @@ in
       '';
     };
 
+    snapshotRetentionDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 180;
+      description = ''
+        Delete rating snapshots after this many days. 0 keeps snapshots forever.
+        Existing tables created before this option was added are not modified.
+      '';
+    };
+
     environment = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
@@ -259,8 +268,9 @@ in
         ExecStart = "${cfg.package}/bin/truesight";
         User = cfg.user;
         Group = cfg.group;
-        Restart = "on-failure";
+        Restart = "always";
         RestartSec = 5;
+        TimeoutStopSec = 20;
         UMask = "0077";
 
         LoadCredential =
@@ -286,6 +296,7 @@ in
             "TRUESIGHT_REGULARIZATION=${toString cfg.ranker.lambda}"
             "TRUESIGHT_MIN_RATED_GAMES=${toString cfg.ranker.minGames}"
             "TRUESIGHT_RAW_RETENTION_DAYS=${toString cfg.rawRetentionDays}"
+            "TRUESIGHT_SNAPSHOT_RETENTION_DAYS=${toString cfg.snapshotRetentionDays}"
           ]
           ++ lib.optional (cfg.collector.startSeq != null)
             "TRUESIGHT_START_SEQ=${toString cfg.collector.startSeq}"
@@ -296,6 +307,7 @@ in
           ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
 
         NoNewPrivileges = true;
+        CapabilityBoundingSet = [ "" ];
         PrivateDevices = true;
         PrivateTmp = true;
         ProtectClock = true;
@@ -304,7 +316,9 @@ in
         ProtectKernelLogs = true;
         ProtectKernelModules = true;
         ProtectKernelTunables = true;
+        ProtectProc = "invisible";
         ProtectSystem = "strict";
+        ProcSubset = "pid";
         RestrictAddressFamilies = [
           "AF_INET"
           "AF_INET6"
@@ -313,10 +327,16 @@ in
         ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
+        RestrictSUIDSGID = true;
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         RemoveIPC = true;
         SystemCallArchitectures = "native";
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
       };
     };
 
