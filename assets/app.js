@@ -2,6 +2,8 @@ const state = {
   period: "day",
   heroes: [],
   search: "",
+  loading: false,
+  lastFocused: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -19,9 +21,11 @@ const el = {
 const CDN = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes";
 
 function showDetail(detail) {
+  state.lastFocused = document.activeElement;
   el.modalBody.innerHTML = detailHtml(detail);
   el.modal.hidden = false;
   document.body.style.overflow = "hidden";
+  el.modal.querySelector(".close")?.focus();
 }
 
 function esc(value) {
@@ -40,7 +44,7 @@ function num(value, digits = 0) {
 function heroIcon(icon, cls = "", iconUrl = "") {
   const url = iconUrl || (icon ? `${CDN}/${encodeURIComponent(icon)}.png` : "");
   if (!url) return `<span class="hero-icon ${cls}"></span>`;
-  return `<img class="hero-icon ${cls}" loading="lazy" alt="" src="${url}">`;
+  return `<img class="hero-icon ${cls}" loading="lazy" alt="" src="${esc(url)}">`;
 }
 
 function deltaHtml(delta) {
@@ -78,13 +82,19 @@ async function api(path) {
 }
 
 async function loadHeroes() {
-  const data = await api(`/api/heroes?period=${state.period}`);
-  state.heroes = data.heroes || [];
-  if (state.heroes.length && state.heroes.every((hero) => !hero.name)) {
-    showError(new Error("Hero names/icons are not loaded yet; check Steam GetHeroes access."));
+  if (state.loading) return;
+  state.loading = true;
+  try {
+    const data = await api(`/api/heroes?period=${state.period}`);
+    state.heroes = data.heroes || [];
+    if (state.heroes.length && state.heroes.every((hero) => !hero.name)) {
+      showError(new Error("Hero names/icons are not loaded yet; check Steam GetHeroes access."));
+    }
+    renderMeta(data);
+    renderLeaderboard();
+  } finally {
+    state.loading = false;
   }
-  renderMeta(data);
-  renderLeaderboard();
 }
 
 function renderMeta(data) {
@@ -130,7 +140,7 @@ function renderLeaderboard() {
     const rank = hero.rank || index + 1;
     const rankClass = rank <= 3 ? `rank-${rank}` : "";
     const winRate = Math.max(0, Math.min(1, Number(hero.win_rate || 0)));
-    return `<tr data-hero="${hero.hero_id}">
+    return `<tr data-hero="${hero.hero_id}" tabindex="0" role="button">
       <td class="num ${rankClass}">${rank}</td>
       <td>
         <div class="hero-cell">
@@ -151,7 +161,14 @@ function renderLeaderboard() {
     </tr>`;
   }).join("");
   el.heroRows.querySelectorAll("tr[data-hero]").forEach((row) => {
-    row.addEventListener("click", () => openHero(Number(row.dataset.hero)));
+    const open = () => openHero(Number(row.dataset.hero));
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
   });
 }
 
@@ -242,6 +259,9 @@ function counterColumns(beats, losesTo) {
 function closeModal() {
   el.modal.hidden = true;
   document.body.style.overflow = "";
+  const target = state.lastFocused;
+  state.lastFocused = null;
+  target?.focus?.();
 }
 
 function setPeriod(period) {
@@ -268,4 +288,9 @@ document.addEventListener("keydown", (event) => {
 });
 
 loadHeroes().catch(showError);
-setInterval(() => loadHeroes().catch(showError), 60_000);
+setInterval(() => {
+  if (!document.hidden) loadHeroes().catch(showError);
+}, 60_000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) loadHeroes().catch(showError);
+});

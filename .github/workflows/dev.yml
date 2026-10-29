@@ -4,11 +4,10 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - '.envrc'
-      - '.gitignore'
-      - 'LICENSE'
-      - 'README.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +16,7 @@ jobs:
   build:
     name: ${{ matrix.os }}-${{ matrix.target }}-${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,20 +40,21 @@ jobs:
         prefix-key: ${{ matrix.os }}-${{ matrix.target }}-${{ matrix.toolchain }}
 
     - name: Format Check
-      run: cargo fmt --check
+      run: cargo fmt --check --all
 
     - name: Clippy Check
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
 
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --verbose --all-targets
 
     - name: Test
-      run: cargo test --verbose
+      run: cargo test --verbose --all-targets
 
   nix-build:
     name: Nix Build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31

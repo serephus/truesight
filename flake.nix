@@ -33,8 +33,8 @@
         owner = "serephus";
         name = "truesight";
 
-        description = "description";
-        homepage = "homepage";
+        description = "Dota 2 hero strength ratings from the public ranked match stream";
+        homepage = "https://github.com/serephus/truesight";
         topics = [
           "rust"
           "dota2"

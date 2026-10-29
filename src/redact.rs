@@ -60,40 +60,25 @@ fn redact_sensitive_params(text: &str) -> String {
     let mut ranges = Vec::new();
 
     for name in SENSITIVE_PARAMS {
-        let needle = format!("{name}=");
-        for (index, _) in lower.match_indices(&needle) {
-            if let Some(previous) = lower[..index].chars().next_back()
-                && (previous.is_ascii_alphanumeric() || previous == '_')
-            {
+        // JSON style: `"name": "value"`.
+        let json_needle = format!("\"{name}\"");
+        for (index, _) in lower.match_indices(&json_needle) {
+            push_value(text, index + json_needle.len(), &mut ranges);
+        }
+
+        // Query/form, header, and log style: `name=value` or `name: value`.
+        for (index, _) in lower.match_indices(name) {
+            if !boundary_before(&lower, index) {
                 continue;
             }
-            let start = index + needle.len();
-            let mut end = start;
-            for (offset, character) in text[start..].char_indices() {
-                if matches!(
-                    character,
-                    '&' | ' '
-                        | '\t'
-                        | '\n'
-                        | '\r'
-                        | '"'
-                        | '\''
-                        | ')'
-                        | ']'
-                        | '}'
-                        | ','
-                        | ';'
-                        | '<'
-                        | '>'
-                ) {
-                    break;
-                }
-                end = start + offset + character.len_utf8();
-            }
-            if end > start {
-                ranges.push((start, end));
-            }
+            push_value(text, index + name.len(), &mut ranges);
         }
+    }
+
+    // Authorization headers often contain a bearer token without a name=value pair.
+    for (index, _) in lower.match_indices("bearer ") {
+        let start = skip_whitespace(text, index + "bearer ".len());
+        push_delimited(text, start, None, &mut ranges);
     }
 
     if ranges.is_empty() {
@@ -121,6 +106,82 @@ fn redact_sensitive_params(text: &str) -> String {
     }
     output.push_str(&text[cursor..]);
     output
+}
+
+fn boundary_before(text: &str, index: usize) -> bool {
+    match text[..index].chars().next_back() {
+        Some(previous) => !(previous.is_ascii_alphanumeric() || previous == '_'),
+        None => true,
+    }
+}
+
+fn skip_whitespace(text: &str, mut cursor: usize) -> usize {
+    while let Some(character) = text[cursor..].chars().next() {
+        if !character.is_whitespace() {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor
+}
+
+/// Extracts the value after a `=` or `:` separator, if one is present.
+fn push_value(text: &str, after_name: usize, ranges: &mut Vec<(usize, usize)>) {
+    let cursor = skip_whitespace(text, after_name);
+    let Some(separator) = text[cursor..].chars().next() else {
+        return;
+    };
+    if separator != '=' && separator != ':' {
+        return;
+    }
+    let cursor = skip_whitespace(text, cursor + separator.len_utf8());
+    push_delimited(text, cursor, None, ranges);
+}
+
+/// Pushes the range of a value, optionally quoted, stopping at the matching
+/// quote or the first delimiter.
+fn push_delimited(
+    text: &str,
+    cursor: usize,
+    quote: Option<char>,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let cursor = skip_whitespace(text, cursor);
+    let quote = quote.or_else(|| {
+        text[cursor..]
+            .chars()
+            .next()
+            .filter(|character| *character == '"' || *character == '\'')
+    });
+    let start = cursor + quote.map_or(0, char::len_utf8);
+    let mut end = start;
+    let mut escaped = false;
+    for (offset, character) in text[start..].char_indices() {
+        if let Some(quote) = quote {
+            if escaped {
+                escaped = false;
+                end = start + offset + character.len_utf8();
+                continue;
+            }
+            if character == '\\' {
+                escaped = true;
+                end = start + offset + character.len_utf8();
+                continue;
+            }
+            if character == quote {
+                break;
+            }
+        } else if matches!(
+            character,
+            '&' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | ')' | ']' | '}' | ',' | ';' | '<' | '>'
+        ) {
+            break;
+        }
+        end = start + offset + character.len_utf8();
+    }
+    if end > start {
+        ranges.push((start, end));
+    }
 }
 
 /// A writer that buffers complete lines and redacts them before writing.
@@ -204,6 +265,24 @@ mod tests {
     fn does_not_redact_words_containing_key() {
         let redactor = Redactor::default();
         assert_eq!(redactor.redact("monkey=banana"), "monkey=banana");
+    }
+
+    #[test]
+    fn redacts_quoted_json_and_header_values() {
+        let redactor = Redactor::default();
+        assert_eq!(
+            redactor.redact(r#"{"key":"abc","name":"ok"}"#),
+            r#"{"key":"[REDACTED]","name":"ok"}"#
+        );
+        assert_eq!(
+            redactor.redact("Authorization: Bearer abc123"),
+            "Authorization: Bearer [REDACTED]"
+        );
+        assert_eq!(redactor.redact(r#"key="abc""#), r#"key="[REDACTED]""#);
+        assert_eq!(
+            redactor.redact("password: hunter2\n"),
+            "password: [REDACTED]\n"
+        );
     }
 
     #[test]
