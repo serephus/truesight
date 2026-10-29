@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    future::IntoFuture,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -103,11 +104,22 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(state: AppState, bind: SocketAddr, ct: CancellationToken) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "web server listening");
+    let shutdown = ct.clone();
     let server = axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move { ct.cancelled().await });
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT, server).await {
-        Ok(result) => result?,
-        Err(_) => warn!("web server shutdown timed out; forcing exit"),
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result?,
+        _ = ct.cancelled() => {
+            // The timeout starts here, not when the server starts, so a normal
+            // long-running server is not killed after SHUTDOWN_TIMEOUT.
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => warn!("web server shutdown timed out; forcing exit"),
+            }
+        }
     }
     Ok(())
 }

@@ -158,7 +158,7 @@ impl SteamClient {
             .get_json(HEROES_PATH, &[("language", "en".to_owned())])
             .await;
         let value = value?;
-        let result = api_result(&value)?;
+        let result = api_result_any(&value)?;
         let heroes = result
             .get("heroes")
             .and_then(Value::as_array)
@@ -365,6 +365,35 @@ fn api_result(value: &Value) -> Result<&Value> {
     Ok(result)
 }
 
+/// Some Steam endpoints (notably `GetHeroes`) report `status: 200` on success
+/// instead of the match endpoints' `status: 1`.
+fn api_result_any(value: &Value) -> Result<&Value> {
+    let result = value
+        .get("result")
+        .context("Steam response is missing result")?;
+    if let Some(error) = result
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        bail!("Steam API error: {error}");
+    }
+    if let Some(status) = result.get("status").and_then(Value::as_u64)
+        && status != 1
+        && status != 200
+    {
+        let detail = result
+            .get("statusDetail")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if detail.is_empty() {
+            bail!("Steam API returned status {status}");
+        }
+        bail!("Steam API returned status {status}: {detail}");
+    }
+    Ok(result)
+}
+
 fn api_error(value: &Value) -> Option<String> {
     let result = value.get("result")?;
     if let Some(error) = result
@@ -429,5 +458,17 @@ mod tests {
     fn parses_successful_result() {
         let value = json!({"result": {"status": 1, "matches": []}});
         assert!(api_result(&value).unwrap().get("matches").is_some());
+    }
+
+    #[test]
+    fn hero_result_accepts_status_200() {
+        let value = json!({"result": {"status": 200, "heroes": []}});
+        assert!(api_result_any(&value).unwrap().get("heroes").is_some());
+    }
+
+    #[test]
+    fn hero_result_rejects_failed_status() {
+        let value = json!({"result": {"status": 0, "statusDetail": "invalid key"}});
+        assert!(api_result_any(&value).is_err());
     }
 }
