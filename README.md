@@ -25,32 +25,44 @@ Steam Web API ──► collector ──► ClickHouse ──► ranker ──�
 - Rating uses games with 10 players, at least 10 minutes of duration, and no
   abandons. All matches are still stored.
 - Multiple Steam keys are rotated automatically with per-key cooldowns on
-  429/5xx/invalid-key responses.
+  429/5xx/invalid-key/network responses.
 
 The collector tracks the live stream with `GetMatchHistory` and adapts its
 request rate to Valve's rate limit.
 
-- Every ~30 s it fetches the newest public match sequence and estimates:
+- Every 10 minutes it fetches the newest public match sequence and estimates:
   - `lag_matches = head_seq - cursor`
   - the stream rate in matches/second from consecutive head samples
   - `lag_seconds = lag_matches / stream_rate`
+- Between head refreshes the head sequence is extrapolated at the observed
+  stream rate, up to a 30-minute limit. If the history stream returns repeated
+  empty batches, the head is re-anchored at the cursor so a stale estimate does
+  not keep the collector polling at catch-up speed.
 - The request governor works in requests/second:
   - initial rate = `1 / TRUESIGHT_POLL_INTERVAL_MS`
   - floor = `1 / TRUESIGHT_MAX_POLL_INTERVAL_MS`
   - ceiling = `1 / TRUESIGHT_MIN_POLL_INTERVAL_MS`
-- While behind (`head_seq > cursor`), it runs at the current rate ceiling.
+- While behind, the rate target drains the backlog over roughly 2 hours
+  (`stream_rate + lag / 2h`, divided by batch size), capped by the durable
+  ceiling. A small backlog therefore does not automatically run at full speed.
 - When caught up, it slows to the observed stream rate divided by batch size.
-- On HTTP 429, it halves the current rate, lowers a durable ceiling to 80% of
-  the rate that triggered the 429, and enforces a 30 s cooldown.
+- Only global or repeated 429 evidence (429s across multiple keys, or all keys
+  exhausted) halves the current rate and lowers a durable ceiling to 80% of the
+  rate that triggered it. A single key hitting its own quota is handled by that
+  key's cooldown and does not slow the other keys or stall the request gate.
 - After the cooldown, while still behind, the current rate probes upward by 5%
-  per successful batch, but only up to that durable ceiling.
-- After 5 minutes with no 429, the durable ceiling itself recovers by 1%; this
-  repeats every quiet 5-minute period, up to the interval-derived maximum.
-  Recovery is intentionally much slower than the backoff.
-- If no 429 has occurred, the ceiling is the interval-derived maximum.
+  per successful batch toward the lag-aware target, but only up to the durable
+  ceiling.
+- After 5 minutes with no global 429, the durable ceiling recovers by 1% every
+  2 minutes up to 90% of the rate that last triggered a global limit, then by
+  1% every 5 minutes above that. Recovery is intentionally much slower than
+  the backoff.
+- If no global 429 has occurred, the ceiling is the interval-derived maximum.
 - It never issues requests faster than the current ceiling, and all Steam
   requests (head + history) share the same gate.
-- Non-429 failures use a 5/10/20/40/60 s backoff; per-key cooldowns still apply.
+- Non-429 failures use a 5/10/20/30 s backoff. Network/body-read/invalid-JSON
+  errors only cool the key for 2 s instead of building an exponential penalty;
+  invalid keys cool for an hour.
 
 The effective match rate is `request_rate * batch_size * 60` matches/minute.
 With the defaults (`5000ms`, batch `100`), the initial rate is 0.2 req/s
