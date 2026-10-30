@@ -47,8 +47,10 @@ request rate to Valve's rate limit.
   ceiling. A small backlog therefore does not automatically run at full speed.
 - When caught up, it slows to the observed stream rate divided by batch size.
 - A Steam request retries at most one additional key (2 attempts total).
-  Retries from the same logical request count as **one** throttle call; they
-  are not treated as multiple independent global-limit events.
+  `ThrottleTracker` records every key hit with the call ID, so per-key
+  history is retained. Retries from the same logical request still count as
+  **one** throttle call and are not treated as multiple independent global
+  events.
 - Only global or repeated 429 evidence from separate calls (429s across keys
   over time, or all keys exhausted) halves the current rate.
 - The durable ceiling is lowered only when the collector was actually running

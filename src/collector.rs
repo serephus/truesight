@@ -266,11 +266,11 @@ impl HeadState {
     }
 }
 
-/// Tracks 429s across calls so repeated pressure on different keys can be
-/// distinguished from a single key hitting its own quota.
+/// Tracks individual key 429 hits across logical calls.
 #[derive(Debug)]
 struct ThrottleTracker {
-    calls: Vec<(Instant, Vec<usize>)>,
+    hits: Vec<(Instant, u64, usize)>,
+    next_call: u64,
     last_global_limit: Option<Instant>,
     key_count: usize,
 }
@@ -278,7 +278,8 @@ struct ThrottleTracker {
 impl ThrottleTracker {
     fn new(key_count: usize) -> Self {
         Self {
-            calls: Vec::new(),
+            hits: Vec::new(),
+            next_call: 0,
             last_global_limit: None,
             key_count,
         }
@@ -291,21 +292,23 @@ impl ThrottleTracker {
         if !throttle.is_limited() {
             return false;
         }
-        self.calls.push((now, throttle.keys().to_vec()));
-        self.calls
-            .retain(|(at, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW);
+        let call = self.next_call;
+        self.next_call = self.next_call.wrapping_add(1);
+        for key in throttle.keys() {
+            self.hits.push((now, call, *key));
+        }
+        self.hits
+            .retain(|(at, _, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW);
 
-        let mut keys: Vec<usize> = self
-            .calls
-            .iter()
-            .flat_map(|(_, keys)| keys.iter().copied())
-            .collect();
+        let mut calls: Vec<u64> = self.hits.iter().map(|(_, call, _)| *call).collect();
+        calls.sort_unstable();
+        calls.dedup();
+        let mut keys: Vec<usize> = self.hits.iter().map(|(_, _, key)| *key).collect();
         keys.sort_unstable();
         keys.dedup();
 
-        let calls = self.calls.len();
-        let repeated = calls >= 2 && keys.len() >= 2;
-        let all_keys = calls >= 2 && self.key_count > 0 && keys.len() >= self.key_count;
+        let repeated = calls.len() >= 2 && keys.len() >= 2;
+        let all_keys = calls.len() >= 2 && self.key_count > 0 && keys.len() >= self.key_count;
         let allowed = self
             .last_global_limit
             .map(|last| now.saturating_duration_since(last) >= RATE_LIMIT_WINDOW)
@@ -317,6 +320,18 @@ impl ThrottleTracker {
         } else {
             false
         }
+    }
+
+    fn recent_keys(&self, now: Instant) -> Vec<usize> {
+        let mut keys: Vec<usize> = self
+            .hits
+            .iter()
+            .filter(|(at, _, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW)
+            .map(|(_, _, key)| *key)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 }
 
@@ -344,6 +359,12 @@ fn assess_throttle(
         return false;
     }
     let global = tracker.observe(throttle, now);
+    debug!(
+        call_keys = ?throttle.keys(),
+        tracked_keys = ?tracker.recent_keys(now),
+        global,
+        "assessed throttle evidence"
+    );
     if global {
         governor.on_rate_limit(now);
     }
@@ -989,6 +1010,17 @@ mod tests {
         let mut tracker = ThrottleTracker::new(3);
         let now = Instant::now();
         assert!(!tracker.observe(&throttle(&[0]), now));
+    }
+
+    #[test]
+    fn tracker_records_individual_keys_across_calls() {
+        let mut tracker = ThrottleTracker::new(3);
+        let now = Instant::now();
+        assert!(!tracker.observe(&throttle(&[0, 1]), now));
+        assert_eq!(tracker.recent_keys(now), vec![0, 1]);
+        let later = now + Duration::from_secs(10);
+        assert!(tracker.observe(&throttle(&[2]), later));
+        assert_eq!(tracker.recent_keys(later), vec![0, 1, 2]);
     }
 
     #[test]
