@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 const HISTORY_PATH: &str = "/IDOTA2Match_570/GetMatchHistoryBySequenceNum/v1/";
 const LATEST_PATH: &str = "/IDOTA2Match_570/GetMatchHistory/v1/";
 const HEROES_PATH: &str = "/IEconDOTA2_570/GetHeroes/v1/";
+const MAX_ATTEMPTS: usize = 2;
 const TRANSIENT_KEY_COOLDOWN: Duration = Duration::from_secs(2);
 const AUTH_KEY_COOLDOWN: Duration = Duration::from_secs(3600);
 
@@ -174,7 +175,7 @@ impl SteamClient {
 
     async fn get_json(&self, path: &str, params: &[(&str, String)]) -> (Result<Value>, Throttle) {
         let url = format!("{}{}", self.base_url, path);
-        let max_attempts = self.key_count().saturating_mul(2).max(2);
+        let max_attempts = MAX_ATTEMPTS;
         let mut last_error = None;
         let mut throttle = Throttle::default();
 
