@@ -46,17 +46,23 @@ request rate to Valve's rate limit.
   (`stream_rate + lag / 2h`, divided by batch size), capped by the durable
   ceiling. A small backlog therefore does not automatically run at full speed.
 - When caught up, it slows to the observed stream rate divided by batch size.
-- Only global or repeated 429 evidence (429s across multiple keys, or all keys
-  exhausted) halves the current rate and lowers a durable ceiling to 80% of the
-  rate that triggered it. A single key hitting its own quota is handled by that
-  key's cooldown and does not slow the other keys or stall the request gate.
+- A Steam request retries at most one additional key (2 attempts total).
+  `ThrottleTracker` records every key hit with the call ID, so per-key
+  history is retained. Retries from the same logical request still count as
+  **one** throttle call and are not treated as multiple independent global
+  events.
+- Only global or repeated 429 evidence from separate calls (429s across keys
+  over time, or all keys exhausted) halves the current rate.
+- The durable ceiling is lowered only when the collector was actually running
+  near it (>= 85% of the cap). A 429 while caught up or running slowly halves
+  the current rate but leaves the sustainable ceiling intact.
+- The cap falls to 80% of the rate that triggered a global limit.
 - After the cooldown, while still behind, the current rate probes upward by 5%
   per successful batch toward the lag-aware target, but only up to the durable
   ceiling.
-- After 5 minutes with no global 429, the durable ceiling recovers by 1% every
-  2 minutes up to 90% of the rate that last triggered a global limit, then by
-  1% every 5 minutes above that. Recovery is intentionally much slower than
-  the backoff.
+- After 5 minutes with no global 429, the durable ceiling recovers by 2% every
+  60 seconds up to 90% of the rate that last triggered a global limit, then by
+  2% every 120 seconds above that, bounded by the interval-derived maximum.
 - If no global 429 has occurred, the ceiling is the interval-derived maximum.
 - It never issues requests faster than the current ceiling, and all Steam
   requests (head + history) share the same gate.

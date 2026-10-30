@@ -23,9 +23,9 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(300);
 const RATE_PROBE_FACTOR: f64 = 1.05;
 const RATE_LIMIT_SAFE_FRACTION: f64 = 0.80;
 const RATE_CAP_RECOVERY_DELAY: Duration = Duration::from_secs(300);
-const RATE_CAP_RECOVERY_FAST_PERIOD: Duration = Duration::from_secs(120);
-const RATE_CAP_RECOVERY_SLOW_PERIOD: Duration = Duration::from_secs(300);
-const RATE_CAP_RECOVERY_FACTOR: f64 = 1.01;
+const RATE_CAP_RECOVERY_FAST_PERIOD: Duration = Duration::from_secs(60);
+const RATE_CAP_RECOVERY_SLOW_PERIOD: Duration = Duration::from_secs(120);
+const RATE_CAP_RECOVERY_FACTOR: f64 = 1.02;
 const RATE_CAP_RECOVERY_FAST_FRACTION: f64 = 0.90;
 const CATCH_UP_HORIZON: Duration = Duration::from_secs(2 * 60 * 60);
 const MIN_ERROR_BACKOFF: Duration = Duration::from_secs(5);
@@ -76,9 +76,15 @@ impl RateGovernor {
     /// Only call this on global/repeated 429 evidence. A single per-key 429 is
     /// handled by the key pool and must not slow every other key down.
     fn on_rate_limit(&mut self, now: Instant) {
-        self.last_throttled_rate = Some(self.rate);
-        let cap = (self.rate * RATE_LIMIT_SAFE_FRACTION).max(self.min_rate);
-        self.max_rate = self.max_rate.min(cap);
+        // A 429 while running well below the cap is usually bursty retries or
+        // a per-key quota, not evidence that the sustainable ceiling is low.
+        // Only cut the durable cap when we were actually using it.
+        let at_cap = self.rate >= self.max_rate * 0.85;
+        if at_cap {
+            self.last_throttled_rate = Some(self.rate);
+            let cap = (self.rate * RATE_LIMIT_SAFE_FRACTION).max(self.min_rate);
+            self.max_rate = self.max_rate.min(cap);
+        }
         self.rate = (self.rate * 0.5).max(self.min_rate).min(self.max_rate);
         self.last_rate_limit = Some(now);
         self.last_cap_recovery = Some(now);
@@ -260,11 +266,11 @@ impl HeadState {
     }
 }
 
-/// Tracks 429s across calls so repeated pressure on different keys can be
-/// distinguished from a single key hitting its own quota.
+/// Tracks individual key 429 hits across logical calls.
 #[derive(Debug)]
 struct ThrottleTracker {
-    hits: Vec<(Instant, usize)>,
+    hits: Vec<(Instant, u64, usize)>,
+    next_call: u64,
     last_global_limit: Option<Instant>,
     key_count: usize,
 }
@@ -273,26 +279,36 @@ impl ThrottleTracker {
     fn new(key_count: usize) -> Self {
         Self {
             hits: Vec::new(),
+            next_call: 0,
             last_global_limit: None,
             key_count,
         }
     }
 
-    /// Returns true when this call is the first global/repeated 429 evidence in
-    /// the current window. A per-key 429 on one key does not qualify.
+    /// A single logical call is one piece of evidence, even if its internal
+    /// retries happen to hit multiple keys. Global evidence requires repeated
+    /// calls across the window, not bursty retries inside one call.
     fn observe(&mut self, throttle: &Throttle, now: Instant) -> bool {
+        if !throttle.is_limited() {
+            return false;
+        }
+        let call = self.next_call;
+        self.next_call = self.next_call.wrapping_add(1);
         for key in throttle.keys() {
-            self.hits.push((now, *key));
+            self.hits.push((now, call, *key));
         }
         self.hits
-            .retain(|(at, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW);
+            .retain(|(at, _, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW);
 
-        let mut keys: Vec<usize> = self.hits.iter().map(|(_, key)| *key).collect();
+        let mut calls: Vec<u64> = self.hits.iter().map(|(_, call, _)| *call).collect();
+        calls.sort_unstable();
+        calls.dedup();
+        let mut keys: Vec<usize> = self.hits.iter().map(|(_, _, key)| *key).collect();
         keys.sort_unstable();
         keys.dedup();
 
-        let all_keys = self.key_count > 0 && keys.len() >= self.key_count;
-        let repeated = keys.len() >= 2;
+        let repeated = calls.len() >= 2 && keys.len() >= 2;
+        let all_keys = calls.len() >= 2 && self.key_count > 0 && keys.len() >= self.key_count;
         let allowed = self
             .last_global_limit
             .map(|last| now.saturating_duration_since(last) >= RATE_LIMIT_WINDOW)
@@ -304,6 +320,18 @@ impl ThrottleTracker {
         } else {
             false
         }
+    }
+
+    fn recent_keys(&self, now: Instant) -> Vec<usize> {
+        let mut keys: Vec<usize> = self
+            .hits
+            .iter()
+            .filter(|(at, _, _)| now.saturating_duration_since(*at) <= RATE_LIMIT_WINDOW)
+            .map(|(_, _, key)| *key)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 }
 
@@ -331,6 +359,12 @@ fn assess_throttle(
         return false;
     }
     let global = tracker.observe(throttle, now);
+    debug!(
+        call_keys = ?throttle.keys(),
+        tracked_keys = ?tracker.recent_keys(now),
+        global,
+        "assessed throttle evidence"
+    );
     if global {
         governor.on_rate_limit(now);
     }
@@ -365,7 +399,7 @@ pub async fn run(
                     match steam.fetch_latest_sequence().await {
                         Ok(cursor) => break cursor,
                         Err(error) => {
-                            warn!(%error, "failed to determine startup sequence, retrying");
+                            warn!(error = %format!("{error:#}"), "failed to determine startup sequence, retrying");
                             if !sleep_or_cancel(&ct, Duration::from_secs(10)).await {
                                 return Ok(());
                             }
@@ -443,7 +477,7 @@ pub async fn run(
                 }
                 Err(error) => {
                     warn!(
-                        %error,
+                        error = %format!("{error:#}"),
                         limited,
                         global,
                         last_known_seq = head.seq,
@@ -548,7 +582,7 @@ pub async fn run(
                     Ok(result) => result,
                     Err(error) => {
                         warn!(
-                            %error,
+                            error = %format!("{error:#}"),
                             token,
                             lag_matches = lag_matches.unwrap_or(0),
                             "failed to store batch, will retry"
@@ -562,7 +596,7 @@ pub async fn run(
                 cursor = batch_end.max(cursor);
                 if let Err(error) = save_cursor(&ch, cursor).await {
                     warn!(
-                        %error,
+                        error = %format!("{error:#}"),
                         cursor,
                         lag_matches = lag_matches.unwrap_or(0),
                         "failed to save collector checkpoint, will retry"
@@ -602,7 +636,7 @@ pub async fn run(
             Err(error) => {
                 if limited {
                     warn!(
-                        %error,
+                        error = %format!("{error:#}"),
                         request_rate = governor.rate(),
                         global,
                         lag_matches = lag_matches.unwrap_or(0),
@@ -613,7 +647,7 @@ pub async fn run(
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     gate.defer(delay);
                     warn!(
-                        %error,
+                        error = %format!("{error:#}"),
                         delay_ms = delay.as_millis(),
                         lag_matches = lag_matches.unwrap_or(0),
                         "Steam request failed; backing off"
@@ -637,7 +671,7 @@ async fn store_batch(
         match Match::from_value(value) {
             Ok(game) if game.is_ranked() => games.push(game),
             Ok(_) => {}
-            Err(error) => debug!(%error, "skipping malformed match"),
+            Err(error) => debug!(error = %format!("{error:#}"), "skipping malformed match"),
         }
     }
     if games.is_empty() {
@@ -732,6 +766,16 @@ mod tests {
         )
     }
 
+    fn at_cap_governor() -> RateGovernor {
+        let mut governor = governor();
+        let now = Instant::now();
+        for _ in 0..100 {
+            governor.on_success(true, 0.5, now);
+        }
+        assert!((governor.rate() - governor.rate_cap()).abs() < 1e-9);
+        governor
+    }
+
     #[test]
     fn initial_rate_is_derived_from_interval() {
         assert!((governor().rate() - 0.2).abs() < 1e-9);
@@ -746,11 +790,11 @@ mod tests {
 
     #[test]
     fn rate_limit_sets_a_durable_cap() {
-        let mut governor = governor();
+        let mut governor = at_cap_governor();
         let now = Instant::now();
         governor.on_rate_limit(now);
         let cap = governor.rate_cap();
-        assert!(cap < 0.2);
+        assert!(cap < 0.5);
         for _ in 0..100 {
             governor.on_success(
                 true,
@@ -763,7 +807,7 @@ mod tests {
 
     #[test]
     fn cap_recovers_after_a_quiet_period() {
-        let mut governor = governor();
+        let mut governor = at_cap_governor();
         let now = Instant::now();
         governor.on_rate_limit(now);
         let cap = governor.rate_cap();
@@ -783,11 +827,11 @@ mod tests {
 
     #[test]
     fn cap_recovery_is_faster_below_the_last_throttled_rate() {
-        let mut governor = governor();
+        let mut governor = at_cap_governor();
         let now = Instant::now();
         governor.on_rate_limit(now);
         let cap = governor.rate_cap();
-        let fast_until = 0.2 * RATE_CAP_RECOVERY_FAST_FRACTION;
+        let fast_until = 0.5 * RATE_CAP_RECOVERY_FAST_FRACTION;
         governor.on_success(false, 0.0, now + RATE_CAP_RECOVERY_DELAY);
         let after_first = governor.rate_cap();
         governor.on_success(
@@ -802,7 +846,7 @@ mod tests {
 
     #[test]
     fn cap_recovery_is_bounded_by_absolute_max() {
-        let mut governor = governor();
+        let mut governor = at_cap_governor();
         let now = Instant::now();
         governor.on_rate_limit(now);
         for index in 1..=2000 {
@@ -969,6 +1013,17 @@ mod tests {
     }
 
     #[test]
+    fn tracker_records_individual_keys_across_calls() {
+        let mut tracker = ThrottleTracker::new(3);
+        let now = Instant::now();
+        assert!(!tracker.observe(&throttle(&[0, 1]), now));
+        assert_eq!(tracker.recent_keys(now), vec![0, 1]);
+        let later = now + Duration::from_secs(10);
+        assert!(tracker.observe(&throttle(&[2]), later));
+        assert_eq!(tracker.recent_keys(later), vec![0, 1, 2]);
+    }
+
+    #[test]
     fn repeated_throttle_across_keys_is_global_evidence() {
         let mut tracker = ThrottleTracker::new(3);
         let now = Instant::now();
@@ -977,9 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn all_keys_throttled_in_one_call_is_global_evidence() {
+    fn all_keys_throttled_in_one_call_is_not_global_evidence() {
         let mut tracker = ThrottleTracker::new(3);
-        assert!(tracker.observe(&throttle(&[0, 1, 2]), Instant::now()));
+        assert!(!tracker.observe(&throttle(&[0, 1, 2]), Instant::now()));
+        assert!(tracker.observe(&throttle(&[0]), Instant::now() + Duration::from_secs(1)));
     }
 
     #[test]
@@ -1022,21 +1078,30 @@ mod tests {
 
     #[test]
     fn global_throttle_cuts_the_governor_and_defers_a_failed_call() {
-        let mut governor = governor();
+        let mut governor = at_cap_governor();
         let mut gate = RequestGate::new(governor.rate());
         let mut tracker = ThrottleTracker::new(3);
         let now = Instant::now();
-        let before_rate = governor.rate();
-        let before_cap = governor.rate_cap();
-        let before_next = gate.next;
 
-        let global = assess_throttle(
-            &throttle(&[0, 1, 2]),
-            false,
+        assert!(!assess_throttle(
+            &throttle(&[0]),
+            true,
             &mut tracker,
             &mut governor,
             &mut gate,
             now,
+        ));
+
+        let before_rate = governor.rate();
+        let before_cap = governor.rate_cap();
+        let before_next = gate.next;
+        let global = assess_throttle(
+            &throttle(&[1]),
+            false,
+            &mut tracker,
+            &mut governor,
+            &mut gate,
+            now + Duration::from_secs(1),
         );
 
         assert!(global);
