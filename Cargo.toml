@@ -7,10 +7,15 @@ license = "MIT"
 repository = "https://github.com/serephus/truesight"
 homepage = "https://github.com/serephus/truesight"
 readme = "README.md"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"
+clickhouse = { version = "0.15.3", default-features = false, features = [
+    "lz4",
+    "rustls-tls-ring",
+    "rustls-tls-webpki-roots",
+] }
 axum = { version = "0.8", default-features = false, features = [
     "http1",
     "json",

@@ -3,6 +3,8 @@ use crate::hero_data;
 use crate::model::HeroRow;
 use crate::steam::SteamClient;
 use anyhow::Result;
+use clickhouse::Row;
+use clickhouse::sql::Identifier;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,12 +14,12 @@ use tracing::{info, warn};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_AGE: u32 = 24 * 3600;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct LastUpdate {
     updated_at: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct ExistingHero {
     hero_id: u16,
 }
@@ -27,7 +29,9 @@ struct ExistingHero {
 /// always wins in the ReplacingMergeTree.
 pub async fn seed_fallback(ch: &ClickHouse) -> Result<()> {
     let existing: Vec<ExistingHero> = ch
-        .query(&format!("SELECT hero_id FROM {} FINAL", ch.table("heroes")))
+        .query_with("SELECT hero_id FROM ? FINAL", |query| {
+            query.bind(Identifier(&ch.table("heroes")))
+        })
         .await?;
     let existing: HashSet<u16> = existing.into_iter().map(|row| row.hero_id).collect();
     let rows: Vec<HeroRow> = hero_data::HEROES
@@ -62,7 +66,7 @@ pub async fn run(ch: ClickHouse, steam: SteamClient, ct: CancellationToken) -> R
             _ = ct.cancelled() => break,
             _ = interval.tick() => {
                 if let Err(error) = refresh(&ch, &steam).await {
-                    warn!(%error, "failed to refresh hero metadata");
+                    warn!(error = %format!("{error:#}"), "failed to refresh hero metadata");
                 }
             }
         }
@@ -74,10 +78,9 @@ pub async fn run(ch: ClickHouse, steam: SteamClient, ct: CancellationToken) -> R
 async fn refresh(ch: &ClickHouse, steam: &SteamClient) -> Result<()> {
     let now = now();
     let rows: Vec<LastUpdate> = ch
-        .query(&format!(
-            "SELECT max(updated_at) AS updated_at FROM {}",
-            ch.table("heroes")
-        ))
+        .query_with("SELECT max(updated_at) AS updated_at FROM ?", |query| {
+            query.bind(Identifier(&ch.table("heroes")))
+        })
         .await?;
     let last = rows.first().map(|row| row.updated_at).unwrap_or(0);
     if last > 0 && now.saturating_sub(last) < MAX_AGE {

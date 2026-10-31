@@ -1,4 +1,4 @@
-use crate::ch::{ClickHouse, quote_string};
+use crate::ch::ClickHouse;
 use crate::hero_data;
 use crate::period::Period;
 use anyhow::Result;
@@ -9,6 +9,8 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use clickhouse::Row;
+use clickhouse::sql::Identifier;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -175,35 +177,38 @@ struct HealthResponse {
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    let matches_table = state.ch.table("matches");
     let matches: Vec<CountRow> = state
         .ch
-        .query(&format!(
-            "SELECT count() AS count, max(start_time) AS latest, max(match_seq_num) AS seq FROM {}",
-            state.ch.table("matches")
-        ))
+        .query_with(
+            "SELECT count() AS count, max(start_time) AS latest, max(match_seq_num) AS seq FROM ?",
+            |query| query.bind(Identifier(&matches_table)),
+        )
         .await
         .map_err(ApiError::internal)?;
     let row = matches.into_iter().next().unwrap_or_default();
 
+    let state_table = state.ch.table("collector_state");
     let seq: Vec<StateValue> = state
         .ch
-        .query(&format!(
-            "SELECT value FROM {} WHERE key = 'last_seq' ORDER BY updated_at DESC LIMIT 1",
-            state.ch.table("collector_state")
-        ))
+        .query_with(
+            "SELECT value FROM ? WHERE key = ? ORDER BY updated_at DESC LIMIT 1",
+            |query| query.bind(Identifier(&state_table)).bind("last_seq"),
+        )
         .await
         .map_err(ApiError::internal)?;
     let last_seq = seq
         .first()
         .and_then(|v| v.value.parse::<u64>().ok())
-        .or(row.seq);
+        .or((row.seq > 0).then_some(row.seq));
 
+    let models_table = state.ch.table("rating_models");
     let models: Vec<ModelTime> = state
         .ch
-        .query(&format!(
-            "SELECT period, max(computed_at) AS computed_at FROM {} GROUP BY period",
-            state.ch.table("rating_models")
-        ))
+        .query_with(
+            "SELECT period, max(computed_at) AS computed_at FROM ? GROUP BY period",
+            |query| query.bind(Identifier(&models_table)),
+        )
         .await
         .map_err(ApiError::internal)?;
     let rankings = models
@@ -211,19 +216,19 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         .map(|m| (m.period, m.computed_at))
         .collect();
 
+    let heroes_table = state.ch.table("heroes");
     let db_heroes = state
         .ch
-        .query::<HeroCount>(&format!(
-            "SELECT uniqExact(hero_id) AS heroes FROM {}",
-            state.ch.table("heroes")
-        ))
+        .query_with::<HeroCount, _>("SELECT uniqExact(hero_id) AS heroes FROM ?", |query| {
+            query.bind(Identifier(&heroes_table))
+        })
         .await
         .map(|rows| rows.first().map(|row| row.heroes).unwrap_or(0))
         .unwrap_or_else(|error| {
-            warn!(%error, "failed to count ClickHouse hero metadata; using hardcoded fallback");
+            warn!(error = %format!("{error:#}"), "failed to count ClickHouse hero metadata; using hardcoded fallback");
             0
         });
-    let heroes_loaded = db_heroes.max(hero_data::HEROES.len() as u32);
+    let heroes_loaded = db_heroes.max(hero_data::HEROES.len() as u64) as u32;
 
     Ok(Json(HealthResponse {
         status: "ok",
@@ -237,27 +242,27 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
     }))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Row)]
 struct CountRow {
     count: u64,
     latest: u32,
-    seq: Option<u64>,
+    seq: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct StateValue {
     value: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct ModelTime {
     period: String,
     computed_at: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct HeroCount {
-    heroes: u32,
+    heroes: u64,
 }
 
 #[derive(Serialize)]
@@ -293,7 +298,7 @@ struct HeroDto {
     rank: u16,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct RatingRow {
     hero_id: u16,
     rating: f64,
@@ -332,7 +337,7 @@ fn hero_dto(row: RatingRow, meta: Option<&HeroMeta>) -> HeroDto {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct ModelRow {
     computed_at: u32,
     patch: String,
@@ -409,7 +414,7 @@ struct HistoryPoint {
     wins: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct HistoryRow {
     computed_at: u32,
     rating: f64,
@@ -429,7 +434,7 @@ struct Counter {
     win_rate: f64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Row)]
 struct PairRow {
     hero_lo: u16,
     hero_hi: u16,
@@ -437,7 +442,7 @@ struct PairRow {
     lo_wins: u64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Row)]
 struct HeroMeta {
     hero_id: u16,
     #[serde(default)]
@@ -482,18 +487,24 @@ async fn hero_detail(
     let window_end = effective_window_end(&model);
     let hero_dto = hero_dto(hero, meta.get(&hero_id));
 
+    let ratings_table = state.ch.table("hero_ratings");
     let history: Vec<HistoryPoint> = state
         .ch
-        .query::<HistoryRow>(&format!(
+        .query_with::<HistoryRow, _>(
             "SELECT computed_at, rating, rating_se, games, wins
-             FROM {}
-             WHERE period = {} AND patch = {} AND hero_id = {hero_id}
-               AND computed_at <= {computed_at}
+             FROM ?
+             WHERE period = ? AND patch = ? AND hero_id = ?
+               AND computed_at <= ?
              ORDER BY computed_at DESC LIMIT 168",
-            state.ch.table("hero_ratings"),
-            quote_string(period.as_str()),
-            quote_string(&model.patch)
-        ))
+            |query| {
+                query
+                    .bind(Identifier(&ratings_table))
+                    .bind(period.as_str())
+                    .bind(&model.patch)
+                    .bind(hero_id)
+                    .bind(computed_at)
+            },
+        )
         .await
         .map_err(ApiError::internal)?
         .into_iter()
@@ -591,30 +602,36 @@ async fn latest_ratings(
     patch: &str,
     hero_id: Option<u16>,
 ) -> Result<Vec<RatingRow>> {
-    let filter = hero_id
-        .map(|id| format!(" AND hero_id = {id}"))
-        .unwrap_or_default();
-    let sql = format!(
+    let table = ch.table("hero_ratings");
+    let hero_id = hero_id.unwrap_or(0);
+    ch.query_with::<RatingRow, _>(
         "SELECT hero_id, rating, rating_se, games, wins,
                 win_rate, prev_rating, delta, rank
-         FROM {}
-         WHERE period = {} AND patch = {} AND computed_at = {computed_at}{filter}
+         FROM ?
+         WHERE period = ? AND patch = ? AND computed_at = ?
+           AND (? = 0 OR hero_id = ?)
          ORDER BY rank ASC",
-        ch.table("hero_ratings"),
-        quote_string(period.as_str()),
-        quote_string(patch)
-    );
-    ch.query(&sql).await
+        |query| {
+            query
+                .bind(Identifier(&table))
+                .bind(period.as_str())
+                .bind(patch)
+                .bind(computed_at)
+                .bind(hero_id)
+                .bind(hero_id)
+        },
+    )
+    .await
 }
 
 async fn latest_model(ch: &ClickHouse, period: Period) -> Result<Option<ModelRow>> {
+    let table = ch.table("rating_models");
     let rows: Vec<ModelRow> = ch
-        .query(&format!(
+        .query_with(
             "SELECT computed_at, patch, window_start, window_end, matches, converged, radiant_advantage
-             FROM {} WHERE period = {} ORDER BY computed_at DESC LIMIT 1",
-            ch.table("rating_models"),
-            quote_string(period.as_str())
-        ))
+             FROM ? WHERE period = ? ORDER BY computed_at DESC LIMIT 1",
+            |query| query.bind(Identifier(&table)).bind(period.as_str()),
+        )
         .await?;
     Ok(rows.into_iter().next())
 }
@@ -635,17 +652,23 @@ async fn pair_rows(
 
     let since_hour = window_start / 3600 * 3600;
     let end_hour = window_end / 3600 * 3600;
+    let table = state.ch.table("hero_matchups_hourly");
     let rows: Vec<PairRow> = state
         .ch
-        .query(&format!(
+        .query_with(
             "SELECT hero_lo, hero_hi,
                     sum(games) AS games,
                     sum(lo_wins) AS lo_wins
-             FROM {}
-             WHERE hour >= {since_hour} AND hour <= {end_hour}
+             FROM ?
+             WHERE hour >= ? AND hour <= ?
              GROUP BY hero_lo, hero_hi",
-            state.ch.table("hero_matchups_hourly")
-        ))
+            |query| {
+                query
+                    .bind(Identifier(&table))
+                    .bind(since_hour)
+                    .bind(end_hour)
+            },
+        )
         .await
         .map_err(ApiError::internal)?;
     state.cache.write().await.insert(
@@ -727,13 +750,14 @@ async fn hero_meta(state: &AppState) -> Arc<HashMap<u16, HeroMeta>> {
     }
 
     let mut heroes = fallback_hero_meta();
+    let table = state.ch.table("heroes");
     match state
         .ch
-        .query::<HeroMeta>(&format!(
+        .query_with::<HeroMeta, _>(
             "SELECT hero_id, name, localized_name, icon, primary_attr, attack_type, roles
-             FROM {} FINAL",
-            state.ch.table("heroes")
-        ))
+             FROM ? FINAL",
+            |query| query.bind(Identifier(&table)),
+        )
         .await
     {
         Ok(rows) => {
@@ -742,7 +766,7 @@ async fn hero_meta(state: &AppState) -> Arc<HashMap<u16, HeroMeta>> {
             }
         }
         Err(error) => {
-            warn!(%error, "failed to load hero metadata from ClickHouse; using hardcoded fallback");
+            warn!(error = %format!("{error:#}"), "failed to load hero metadata from ClickHouse; using hardcoded fallback");
         }
     }
     let meta = Arc::new(heroes);

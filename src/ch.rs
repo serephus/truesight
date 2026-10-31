@@ -1,21 +1,15 @@
 use crate::config::validate_identifier;
-use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode};
-use serde::{Serialize, de::DeserializeOwned};
-use std::time::Duration;
+use anyhow::{Context, Result};
+use clickhouse::query::Query;
+use clickhouse::{Client, RowOwned, RowRead, RowWrite};
+use std::{future::Future, time::Duration};
 
 #[derive(Clone)]
 pub struct ClickHouse {
-    http: Client,
-    url: String,
-    user: String,
-    password: String,
+    bootstrap: Client,
+    client: Client,
     database: String,
-}
-
-#[derive(serde::Deserialize)]
-struct JsonResponse<T> {
-    data: Vec<T>,
+    timeout: Duration,
 }
 
 impl ClickHouse {
@@ -27,24 +21,30 @@ impl ClickHouse {
         timeout: Duration,
     ) -> Result<Self> {
         validate_identifier(database)?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .no_proxy()
-            .pool_idle_timeout(Duration::from_secs(60))
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .context("failed to build ClickHouse HTTP client")?;
+        let mut client = Client::default()
+            .with_url(url.trim_end_matches('/'))
+            .with_database("default")
+            .with_setting("async_insert", "0")
+            .with_setting("wait_end_of_query", "1")
+            .with_setting("join_use_nulls", "0");
+        if !user.is_empty() {
+            client = client.with_user(user);
+        }
+        if !password.is_empty() {
+            client = client.with_password(password);
+        }
+        let bootstrap = client;
+        let client = bootstrap.clone().with_database(database);
         Ok(Self {
-            http,
-            url: url.trim_end_matches('/').to_owned(),
-            user: user.to_owned(),
-            password: password.to_owned(),
+            bootstrap,
+            client,
             database: database.to_owned(),
+            timeout,
         })
     }
 
     pub fn table(&self, name: &str) -> String {
-        format!("{}.{}", self.database, name)
+        name.to_owned()
     }
 
     pub async fn migrate(
@@ -65,31 +65,31 @@ impl ClickHouse {
     }
 
     pub async fn execute(&self, sql: &str) -> Result<()> {
-        self.send(sql, None, &[]).await.map(|_| ())
+        self.with_timeout(self.bootstrap.query_raw(sql).execute(), "query")
+            .await
     }
 
-    pub async fn query<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
-        let body = format!("{sql}\nFORMAT JSON");
-        let text = self
-            .send(
-                &body,
-                None,
-                &[
-                    ("output_format_json_quote_64bit_integers", "0"),
-                    ("join_use_nulls", "0"),
-                ],
-            )
-            .await?;
-        let parsed: JsonResponse<T> = serde_json::from_str(&text).with_context(|| {
-            format!(
-                "failed to decode ClickHouse JSON response: {}",
-                truncate(&text, 500)
-            )
-        })?;
-        Ok(parsed.data)
+    pub async fn query_with<T, F>(&self, sql: &str, apply: F) -> Result<Vec<T>>
+    where
+        T: RowOwned + RowRead,
+        F: FnOnce(Query) -> Query,
+    {
+        let query = apply(self.client.query(sql));
+        self.with_timeout(query.fetch_all::<T>(), "query").await
     }
 
-    pub async fn insert<T: Serialize>(
+    async fn with_timeout<T>(
+        &self,
+        future: impl Future<Output = clickhouse::error::Result<T>>,
+        operation: &str,
+    ) -> Result<T> {
+        tokio::time::timeout(self.timeout, future)
+            .await
+            .with_context(|| format!("ClickHouse {operation} timed out after {:?}", self.timeout))?
+            .with_context(|| format!("ClickHouse {operation} failed"))
+    }
+
+    pub async fn insert<T: RowOwned + RowWrite>(
         &self,
         table: &str,
         rows: &[T],
@@ -98,72 +98,23 @@ impl ClickHouse {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut body = format!("INSERT INTO {} FORMAT JSONEachRow\n", self.table(table));
-        for row in rows {
-            body.push_str(
-                &serde_json::to_string(row)
-                    .with_context(|| format!("failed to encode row for {table}"))?,
-            );
-            body.push('\n');
-        }
-        let mut params = vec![("async_insert", "0"), ("wait_end_of_query", "1")];
+        let mut insert = self
+            .with_timeout(self.client.insert::<T>(table), "insert metadata")
+            .await?
+            .with_timeouts(Some(self.timeout), Some(self.timeout));
         if let Some(token) = dedup_token {
-            params.push(("insert_deduplication_token", token));
+            insert = insert.with_setting("insert_deduplication_token", token);
         }
-        self.send(&body, None, &params).await?;
-        Ok(())
-    }
-
-    async fn send(
-        &self,
-        body: &str,
-        content_type: Option<&str>,
-        params: &[(&str, &str)],
-    ) -> Result<String> {
-        let mut request = self.http.post(&self.url).body(body.to_owned());
-        if !params.is_empty() {
-            request = request.query(params);
+        for row in rows {
+            insert
+                .write(row)
+                .await
+                .with_context(|| format!("failed to write row for {table}"))?;
         }
-        if let Some(content_type) = content_type {
-            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
-        }
-        if !self.user.is_empty() {
-            request = request.header("X-ClickHouse-User", &self.user);
-        }
-        if !self.password.is_empty() {
-            request = request.header("X-ClickHouse-Key", &self.password);
-        }
-
-        let response = request
-            .send()
+        insert
+            .end()
             .await
-            .context("failed to send request to ClickHouse")?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if status != StatusCode::OK {
-            bail!(
-                "ClickHouse returned {status}: {}",
-                truncate(text.trim(), 1000)
-            );
-        }
-        Ok(text)
-    }
-}
-
-pub fn quote_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
-    format!("'{escaped}'")
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        value.to_owned()
-    } else {
-        let mut end = max;
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &value[..end])
+            .with_context(|| format!("failed to finish insert into {table}"))
     }
 }
 
@@ -342,9 +293,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quotes_strings() {
-        assert_eq!(quote_string("day"), "'day'");
-        assert_eq!(quote_string("o'brien\\x"), "'o\\'brien\\\\x'");
+    fn table_names_are_unqualified() {
+        let ch = ClickHouse::new(
+            "http://127.0.0.1:8123",
+            "truesight",
+            "",
+            "",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(ch.table("matches"), "matches");
     }
 
     #[test]
