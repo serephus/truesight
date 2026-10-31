@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use clickhouse::Row;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -327,7 +328,7 @@ impl Hero {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct MatchRow {
     pub match_id: u64,
     pub match_seq_num: u64,
@@ -349,7 +350,7 @@ pub struct MatchRow {
     pub raw: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct PlayerRow {
     pub match_id: u64,
     pub start_time: u32,
@@ -378,7 +379,7 @@ pub struct PlayerRow {
     pub aghanims_shard: u8,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct MatchupRow {
     pub hour: u32,
     pub hero_lo: u16,
@@ -389,7 +390,7 @@ pub struct MatchupRow {
     pub lo_radiant_wins: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct HeroStatRow {
     pub hour: u32,
     pub hero_id: u16,
@@ -399,7 +400,7 @@ pub struct HeroStatRow {
     pub radiant_wins: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct HeroRow {
     pub hero_id: u16,
     pub name: String,
@@ -411,7 +412,7 @@ pub struct HeroRow {
     pub updated_at: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Row)]
 pub struct StateRow {
     pub key: String,
     pub value: String,

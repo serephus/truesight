@@ -3,13 +3,15 @@ use crate::config::CollectorConfig;
 use crate::model::{Accumulator, Match, StateRow};
 use crate::steam::{Head, SteamClient, Throttle};
 use anyhow::{Context, Result};
+use clickhouse::Row;
+use clickhouse::sql::Identifier;
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct StateValue {
     value: String,
 }
@@ -713,10 +715,14 @@ async fn store_batch(
 
 async fn load_cursor(ch: &ClickHouse) -> Result<Option<u64>> {
     let rows: Vec<StateValue> = ch
-        .query(&format!(
-            "SELECT value FROM {} WHERE key = 'last_seq' ORDER BY updated_at DESC LIMIT 1",
-            ch.table("collector_state")
-        ))
+        .query_with(
+            "SELECT value FROM ? WHERE key = ? ORDER BY updated_at DESC LIMIT 1",
+            |query| {
+                query
+                    .bind(Identifier(&ch.table("collector_state")))
+                    .bind("last_seq")
+            },
+        )
         .await?;
     Ok(rows
         .into_iter()

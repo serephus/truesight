@@ -276,6 +276,11 @@ with ClickHouse metadata on read. A Steam refresh always takes precedence.
 | `hero_ratings` | `MergeTree` | Rating snapshots per period |
 | `rating_models` | `MergeTree` | Fit metadata (radiant edge, iterations, …) |
 
+Runtime reads and writes use the official `clickhouse` Rust crate: typed
+`RowBinary` rows, bound query parameters, and `Identifier` binds for table
+names instead of hand-built SQL values or `JSONEachRow`. Schema creation is
+still expressed as idempotent DDL.
+
 Inserts are idempotent for crash replay: each batch uses a deterministic
 `insert_deduplication_token` derived from its sequence range.
 

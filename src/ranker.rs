@@ -1,8 +1,10 @@
-use crate::ch::{ClickHouse, quote_string};
+use crate::ch::ClickHouse;
 use crate::config::RankerConfig;
 use crate::period::Period;
 use crate::rating::{self, FitOptions, HeroCounts, PairCounts};
 use anyhow::{Context, Result};
+use clickhouse::Row;
+use clickhouse::sql::Identifier;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +13,7 @@ use tracing::{info, warn};
 
 const LN_2: f64 = std::f64::consts::LN_2;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct PairAggregate {
     hero_lo: u16,
     hero_hi: u16,
@@ -21,35 +23,35 @@ struct PairAggregate {
     w_lo_radiant_wins: f64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct HeroAggregate {
     hero_id: u16,
-    games: f64,
-    wins: f64,
+    games: u64,
+    wins: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct PreviousRating {
     hero_id: u16,
     rating: f64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct MaxComputedAt {
     computed_at: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct LatestMatch {
     start_time: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct LatestIngest {
     ingested_at: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Row)]
 struct LatestModel {
     computed_at: u32,
     patch: String,
@@ -57,7 +59,7 @@ struct LatestModel {
     window_end: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Row)]
 struct RatingRow {
     computed_at: u32,
     period: String,
@@ -74,7 +76,7 @@ struct RatingRow {
     rank: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Row)]
 struct ModelRow {
     computed_at: u32,
     period: String,
@@ -102,12 +104,12 @@ pub async fn run(ch: ClickHouse, cfg: RankerConfig, ct: CancellationToken) -> Re
                     Ok(Some(anchor)) => {
                         for period in Period::ALL {
                             if let Err(error) = rank_period(&ch, &cfg, period, anchor).await {
-                                warn!(%error, period = period.as_str(), "ranking failed");
+                                warn!(error = %format!("{error:#}"), period = period.as_str(), "ranking failed");
                             }
                         }
                     }
                     Ok(None) => info!("no collected matches yet, skipping ranking"),
-                    Err(error) => warn!(%error, "failed to determine ranking anchor"),
+                    Err(error) => warn!(error = %format!("{error:#}"), "failed to determine ranking anchor"),
                 }
             }
         }
@@ -156,33 +158,48 @@ async fn rank_period(
     let since_hour = window_start / 3600 * 3600;
     let end_hour = window_end / 3600 * 3600;
     let half_life_hours = (period.seconds() as f64 / 2.0) / 3600.0;
-    let weight = format!(
-        "exp(-{LN_2} * (toInt64({window_end}) - toInt64(hour)) / 3600.0 / {half_life_hours})"
-    );
-
-    let pair_sql = format!(
-        "SELECT hero_lo, hero_hi,
-            sum(games * {weight}) AS w_games,
-            sum(lo_wins * {weight}) AS w_lo_wins,
-            sum(lo_radiant_games * {weight}) AS w_lo_radiant_games,
-            sum(lo_radiant_wins * {weight}) AS w_lo_radiant_wins
-         FROM {}
-         WHERE hour >= {since_hour} AND hour <= {end_hour}
-         GROUP BY hero_lo, hero_hi",
-        ch.table("hero_matchups_hourly")
-    );
-    let hero_sql = format!(
-        "SELECT hero_id,
+    let matchup_table = ch.table("hero_matchups_hourly");
+    let hero_table = ch.table("hero_stats_hourly");
+    let pair_sql = "
+        SELECT hero_lo, hero_hi,
+            sum(games * weight) AS w_games,
+            sum(lo_wins * weight) AS w_lo_wins,
+            sum(lo_radiant_games * weight) AS w_lo_radiant_games,
+            sum(lo_radiant_wins * weight) AS w_lo_radiant_wins
+        FROM (
+            SELECT *,
+                exp(-? * (toInt64(?) - toInt64(hour)) / 3600.0 / ?) AS weight
+            FROM ?
+            WHERE hour >= ? AND hour <= ?
+        )
+        GROUP BY hero_lo, hero_hi";
+    let hero_sql = "
+        SELECT hero_id,
             sum(games) AS games,
             sum(wins) AS wins
-         FROM {}
-         WHERE hour >= {since_hour} AND hour <= {end_hour}
-         GROUP BY hero_id",
-        ch.table("hero_stats_hourly")
-    );
+        FROM ?
+        WHERE hour >= ? AND hour <= ?
+        GROUP BY hero_id";
 
-    let pairs: Vec<PairAggregate> = ch.query(&pair_sql).await?;
-    let heroes: Vec<HeroAggregate> = ch.query(&hero_sql).await?;
+    let pairs: Vec<PairAggregate> = ch
+        .query_with(pair_sql, |query| {
+            query
+                .bind(LN_2)
+                .bind(window_end)
+                .bind(half_life_hours)
+                .bind(Identifier(&matchup_table))
+                .bind(since_hour)
+                .bind(end_hour)
+        })
+        .await?;
+    let heroes: Vec<HeroAggregate> = ch
+        .query_with(hero_sql, |query| {
+            query
+                .bind(Identifier(&hero_table))
+                .bind(since_hour)
+                .bind(end_hour)
+        })
+        .await?;
     if pairs.is_empty() || heroes.is_empty() {
         info!(period = period.as_str(), "not enough data for ranking yet");
         return Ok(());
@@ -204,8 +221,8 @@ async fn rank_period(
         .iter()
         .map(|h| HeroCounts {
             hero_id: h.hero_id,
-            games: h.games.max(0.0).round() as u64,
-            wins: h.wins.clamp(0.0, h.games.max(0.0)).round() as u64,
+            games: h.games,
+            wins: h.wins.min(h.games),
         })
         .collect();
 
@@ -257,9 +274,7 @@ async fn rank_period(
         })
         .collect();
 
-    let total_matches = (heroes.iter().map(|h| h.games.max(0.0)).sum::<f64>() / 10.0)
-        .round()
-        .max(0.0) as u64;
+    let total_matches = (heroes.iter().map(|h| h.games).sum::<u64>() as f64 / 10.0).round() as u64;
 
     let token = format!("{}-{}-{computed_at}", period.as_str(), patch);
     ch.insert("hero_ratings", &rows, Some(&format!("{token}-hr")))
@@ -321,11 +336,11 @@ fn window_bounds(period: Period, anchor: u32, patch_start: Option<u32>) -> Optio
 }
 
 async fn latest_match_time(ch: &ClickHouse) -> Result<Option<u32>> {
+    let table = ch.table("matches");
     let rows: Vec<LatestMatch> = ch
-        .query(&format!(
-            "SELECT max(start_time) AS start_time FROM {}",
-            ch.table("matches")
-        ))
+        .query_with("SELECT max(start_time) AS start_time FROM ?", |query| {
+            query.bind(Identifier(&table))
+        })
         .await?;
     Ok(rows
         .first()
@@ -334,11 +349,11 @@ async fn latest_match_time(ch: &ClickHouse) -> Result<Option<u32>> {
 }
 
 async fn latest_ingest_time(ch: &ClickHouse) -> Result<Option<u32>> {
+    let table = ch.table("matches");
     let rows: Vec<LatestIngest> = ch
-        .query(&format!(
-            "SELECT max(ingested_at) AS ingested_at FROM {}",
-            ch.table("matches")
-        ))
+        .query_with("SELECT max(ingested_at) AS ingested_at FROM ?", |query| {
+            query.bind(Identifier(&table))
+        })
         .await?;
     Ok(rows
         .first()
@@ -360,27 +375,27 @@ fn snapshot_is_current(
 }
 
 async fn latest_model(ch: &ClickHouse, period: Period) -> Result<Option<LatestModel>> {
+    let table = ch.table("rating_models");
     let rows: Vec<LatestModel> = ch
-        .query(&format!(
+        .query_with(
             "SELECT computed_at, patch, window_start, window_end
-             FROM {}
-             WHERE period = {}
+             FROM ?
+             WHERE period = ?
              ORDER BY computed_at DESC
              LIMIT 1",
-            ch.table("rating_models"),
-            quote_string(period.as_str())
-        ))
+            |query| query.bind(Identifier(&table)).bind(period.as_str()),
+        )
         .await?;
     Ok(rows.into_iter().next())
 }
 
 async fn next_computed_at(ch: &ClickHouse, period: Period, now: u32) -> Result<u32> {
+    let table = ch.table("rating_models");
     let rows: Vec<MaxComputedAt> = ch
-        .query(&format!(
-            "SELECT max(computed_at) AS computed_at FROM {} WHERE period = {}",
-            ch.table("rating_models"),
-            quote_string(period.as_str())
-        ))
+        .query_with(
+            "SELECT max(computed_at) AS computed_at FROM ? WHERE period = ?",
+            |query| query.bind(Identifier(&table)).bind(period.as_str()),
+        )
         .await?;
     let last = rows.first().map(|row| row.computed_at).unwrap_or(0);
     Ok(now.max(last.saturating_add(1)))
@@ -392,18 +407,26 @@ async fn previous_ratings(
     patch: &str,
     computed_at: u32,
 ) -> Result<Vec<PreviousRating>> {
-    let period = quote_string(period.as_str());
-    let patch = quote_string(patch);
-    ch.query(&format!(
+    let table = ch.table("hero_ratings");
+    let period = period.as_str();
+    ch.query_with(
         "SELECT hero_id, rating
-         FROM {}
-         WHERE period = {period} AND patch = {patch} AND computed_at = (
-             SELECT max(computed_at) FROM {}
-             WHERE period = {period} AND patch = {patch} AND computed_at < {computed_at}
+         FROM ?
+         WHERE period = ? AND patch = ? AND computed_at = (
+             SELECT max(computed_at) FROM ?
+             WHERE period = ? AND patch = ? AND computed_at < ?
          )",
-        ch.table("hero_ratings"),
-        ch.table("hero_ratings")
-    ))
+        |query| {
+            query
+                .bind(Identifier(&table))
+                .bind(period)
+                .bind(patch)
+                .bind(Identifier(&table))
+                .bind(period)
+                .bind(patch)
+                .bind(computed_at)
+        },
+    )
     .await
 }
 

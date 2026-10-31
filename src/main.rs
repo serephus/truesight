@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     )?;
     migrate_with_retry(&ch, cfg.raw_retention_days, cfg.snapshot_retention_days).await?;
     if let Err(error) = heroes::seed_fallback(&ch).await {
-        warn!(%error, "failed to seed hardcoded hero metadata; web will use the built-in fallback");
+        warn!(error = %format!("{error:#}"), "failed to seed hardcoded hero metadata; web will use the built-in fallback");
     }
 
     let steam = if cfg.steam.keys.is_empty() {
@@ -106,11 +106,11 @@ async fn main() -> Result<()> {
         joined = tasks.join_next() => {
             match joined {
                 Some(Ok(Err(error))) => {
-                    error!(%error, "service task failed");
+                    error!(error = %format!("{error:#}"), "service task failed");
                     failed = true;
                 }
                 Some(Err(error)) => {
-                    error!(%error, "service task panicked");
+                    error!(error = %format!("{error:#}"), "service task panicked");
                     failed = true;
                 }
                 Some(Ok(Ok(()))) => {
@@ -130,11 +130,11 @@ async fn main() -> Result<()> {
         match joined {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                warn!(%error, "task failed while shutting down");
+                warn!(error = %format!("{error:#}"), "task failed while shutting down");
                 failed = true;
             }
             Err(error) => {
-                warn!(%error, "task panicked while shutting down");
+                warn!(error = %format!("{error:#}"), "task panicked while shutting down");
                 failed = true;
             }
         }
@@ -162,7 +162,7 @@ async fn migrate_with_retry(
                 return Ok(());
             }
             Err(error) => {
-                warn!(attempt, %error, "ClickHouse not ready, retrying");
+                warn!(attempt, error = %format!("{error:#}"), "ClickHouse not ready, retrying");
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -184,7 +184,7 @@ fn init_tracing(filter: &str, redactor: redact::Redactor) {
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
-            warn!(%error, "failed to listen for Ctrl-C");
+            warn!(error = %format!("{error:#}"), "failed to listen for Ctrl-C");
         }
     };
 
@@ -195,7 +195,7 @@ async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(error) => {
-                warn!(%error, "failed to listen for SIGTERM");
+                warn!(error = %format!("{error:#}"), "failed to listen for SIGTERM");
                 std::future::pending::<()>().await;
             }
         }
