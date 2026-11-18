@@ -91,6 +91,17 @@ async fn main() -> Result<()> {
         warn!("collector disabled; no new matches will be ingested");
     }
 
+    {
+        let ch = ch.clone();
+        let ct = ct.clone();
+        tasks.spawn(async move {
+            if let Err(error) = collector::reparse(&ch, &ct).await {
+                warn!(error = %format!("{error:#}"), "failed to reparse stored raw matches");
+            }
+            Ok(())
+        });
+    }
+
     if cfg.ranker.enabled {
         tasks.spawn(ranker::run(ch.clone(), cfg.ranker.clone(), ct.clone()));
     } else {

@@ -128,6 +128,12 @@ pub fn schema_statements(
     } else {
         String::new()
     };
+    // Failed payloads may not have a usable start_time, so age them from fetch.
+    let raw_match_ttl = if raw_retention_days > 0 {
+        format!(" TTL toDateTime(fetched_at) + INTERVAL {raw_retention_days} DAY")
+    } else {
+        String::new()
+    };
     let snapshot_ttl = if snapshot_retention_days > 0 {
         format!(" TTL toDateTime(computed_at) + INTERVAL {snapshot_retention_days} DAY DELETE")
     } else {
@@ -160,6 +166,18 @@ pub fn schema_statements(
             ENGINE = ReplacingMergeTree(ingested_at)
             PARTITION BY toYYYYMM(toDateTime(start_time))
             ORDER BY (start_time, match_id)"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {database}.raw_matches (
+                match_seq_num UInt64,
+                match_id UInt64,
+                start_time UInt32,
+                fetched_at UInt32,
+                parse_error String CODEC(ZSTD(3)),
+                raw String CODEC(ZSTD(3)){raw_match_ttl}
+            )
+            ENGINE = ReplacingMergeTree(fetched_at)
+            ORDER BY (match_seq_num, match_id)"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.match_players (
@@ -308,10 +326,11 @@ mod tests {
     #[test]
     fn schema_has_all_tables() {
         let statements = schema_statements("truesight", 0, 0);
-        assert_eq!(statements.len(), 9);
+        assert_eq!(statements.len(), 10);
         let joined = statements.join("\n");
         for table in [
             "matches",
+            "raw_matches",
             "match_players",
             "hero_matchups_hourly",
             "hero_stats_hourly",
@@ -329,6 +348,7 @@ mod tests {
     fn schema_applies_raw_ttl() {
         let joined = schema_statements("truesight", 90, 0).join("\n");
         assert!(joined.contains("TTL toDateTime(start_time) + INTERVAL 90 DAY"));
+        assert!(joined.contains("TTL toDateTime(fetched_at) + INTERVAL 90 DAY"));
     }
 
     #[test]
