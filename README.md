@@ -268,6 +268,7 @@ with ClickHouse metadata on read. A Steam refresh always takes precedence.
 | Table | Engine | Purpose |
 |---|---|---|
 | `matches` | `ReplacingMergeTree` | Full match rows + raw JSON |
+| `raw_matches` | `ReplacingMergeTree` | Unparsable payloads kept for reparse |
 | `match_players` | `ReplacingMergeTree` | Per-player detail (items, GPM/XPM, damage, …) |
 | `hero_matchups_hourly` | `SummingMergeTree` | Cross-team pair counts per hour |
 | `hero_stats_hourly` | `SummingMergeTree` | Hero wins/games per hour |
@@ -298,6 +299,10 @@ Inserts are idempotent for crash replay: each batch uses a deterministic
   put nginx in front for public deployments.
 - Steam's sequence endpoint is global; unranked matches are skipped but still
   advance the checkpoint, so the collector never gets stuck on them.
+- Fetching and parsing are decoupled. Payloads the parser rejects (for example
+  after an API change) are stored in `raw_matches`, then the checkpoint advances.
+  On startup, Truesight retries those payloads with the current parser, so a
+  parser fix recovers them without re-fetching from Steam.
 
 ## Model limitations
 
@@ -307,8 +312,9 @@ Inserts are idempotent for crash replay: each batch uses a deterministic
 - Patch boundaries are applied at the hourly aggregate granularity.
 - The schema is created idempotently at boot, but there is no migration
   framework yet. Recreate the database after incompatible schema changes.
-- `TRUESIGHT_RAW_RETENTION_DAYS` is applied when the `matches` table is created;
-  changing it later does not retrofit a column TTL.
+- `TRUESIGHT_RAW_RETENTION_DAYS` is applied when the `matches` and
+  `raw_matches` tables are created; changing it later does not retrofit a column
+  TTL.
 - `TRUESIGHT_SNAPSHOT_RETENTION_DAYS` is applied when the rating tables are
   created; existing tables are not modified automatically.
 

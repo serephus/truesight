@@ -1,6 +1,6 @@
 use crate::ch::ClickHouse;
 use crate::config::CollectorConfig;
-use crate::model::{Accumulator, Match, StateRow};
+use crate::model::{Accumulator, Match, RawMatchRow, StateRow};
 use crate::steam::{Head, SteamClient, Throttle};
 use anyhow::{Context, Result};
 use clickhouse::Row;
@@ -668,22 +668,53 @@ async fn store_batch(
     values: &[serde_json::Value],
     token: &str,
 ) -> Result<(usize, usize)> {
+    let fetched_at = now_secs();
+    let mut raw_rows = Vec::new();
     let mut games = Vec::new();
+    let mut malformed = 0usize;
     for value in values {
         match Match::from_value(value) {
             Ok(game) if game.is_ranked() => games.push(game),
             Ok(_) => {}
-            Err(error) => debug!(error = %format!("{error:#}"), "skipping malformed match"),
+            Err(error) => {
+                malformed = malformed.saturating_add(1);
+                debug!(error = %format!("{error:#}"), "skipping malformed match");
+                raw_rows.push(RawMatchRow::capture(
+                    value,
+                    fetched_at,
+                    format!("{error:#}"),
+                ));
+            }
         }
     }
+    if malformed > 0 {
+        warn!(
+            token,
+            malformed,
+            stored = games.len(),
+            "failed to parse matches; raw payloads retained for reparse"
+        );
+    }
+
+    // Persist payloads that produced no structured rows first, so a later
+    // parser fix can recover them without asking Steam again.
+    ch.insert("raw_matches", &raw_rows, Some(&format!("{token}-raw")))
+        .await
+        .context("failed to insert raw matches")?;
+
+    let rated = store_games(ch, &games, token).await?;
+    Ok((games.len(), rated))
+}
+
+async fn store_games(ch: &ClickHouse, games: &[Match], token: &str) -> Result<usize> {
     if games.is_empty() {
-        return Ok((0, 0));
+        return Ok(0);
     }
 
     let match_rows: Vec<_> = games.iter().map(Match::match_row).collect();
     let player_rows: Vec<_> = games.iter().flat_map(Match::player_rows).collect();
     let mut accumulator = Accumulator::default();
-    for game in &games {
+    for game in games {
         accumulator.add(game);
     }
     let rated = accumulator.matches;
@@ -710,7 +741,98 @@ async fn store_batch(
     .await
     .context("failed to insert hero aggregates")?;
 
-    Ok((games.len(), rated as usize))
+    Ok(rated as usize)
+}
+
+/// Re-run the current parser over payloads that previously failed.
+///
+/// This only touches raw matches without structured rows, so it cannot
+/// double-count hourly aggregates. Rows that still fail are left in place and
+/// retried on the next start.
+pub async fn reparse(ch: &ClickHouse, ct: &CancellationToken) -> Result<()> {
+    const PAGE: u64 = 500;
+
+    let mut last_seq = 0u64;
+    let mut last_id = 0u64;
+    let mut repaired = 0usize;
+    let mut stored = 0usize;
+
+    loop {
+        if ct.is_cancelled() {
+            return Ok(());
+        }
+        let rows: Vec<RawMatchRow> = ch
+            .query_with(
+                "SELECT match_seq_num, match_id, start_time, fetched_at, parse_error, raw \
+                 FROM ? FINAL \
+                 WHERE parse_error != '' \
+                   AND (match_seq_num > ? OR (match_seq_num = ? AND match_id > ?)) \
+                 ORDER BY match_seq_num, match_id LIMIT ?",
+                |query| {
+                    query
+                        .bind(Identifier(&ch.table("raw_matches")))
+                        .bind(last_seq)
+                        .bind(last_seq)
+                        .bind(last_id)
+                        .bind(PAGE)
+                },
+            )
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let page_len = rows.len();
+        let first_seq = rows[0].match_seq_num;
+        last_seq = rows[page_len - 1].match_seq_num;
+        last_id = rows[page_len - 1].match_id;
+        let fetched_at = now_secs();
+
+        let mut games = Vec::new();
+        let mut parsed_rows = Vec::new();
+        for row in rows {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.raw) else {
+                continue;
+            };
+            let Ok(game) = Match::from_value(&value) else {
+                continue;
+            };
+            if game.is_ranked() {
+                games.push(game);
+            }
+            parsed_rows.push(RawMatchRow {
+                fetched_at,
+                parse_error: String::new(),
+                ..row
+            });
+        }
+
+        if !games.is_empty() {
+            let token = format!("reparse-{first_seq}-{last_seq}");
+            store_games(ch, &games, &token).await?;
+            stored = stored.saturating_add(games.len());
+        }
+        if !parsed_rows.is_empty() {
+            ch.insert(
+                "raw_matches",
+                &parsed_rows,
+                Some(&format!("reparse-raw-{last_seq}-{fetched_at}")),
+            )
+            .await
+            .context("failed to mark reparsed matches")?;
+            repaired = repaired.saturating_add(parsed_rows.len());
+        }
+        if (page_len as u64) < PAGE {
+            break;
+        }
+    }
+
+    if repaired > 0 || stored > 0 {
+        info!(repaired, stored, "reparsed previously failed raw matches");
+    } else {
+        debug!("no previously failed raw matches to reparse");
+    }
+    Ok(())
 }
 
 async fn load_cursor(ch: &ClickHouse) -> Result<Option<u64>> {
@@ -744,6 +866,13 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn now_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
 }
 
 async fn sleep_or_cancel(ct: &CancellationToken, duration: Duration) -> bool {

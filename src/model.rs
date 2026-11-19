@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clickhouse::Row;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -350,6 +350,34 @@ pub struct MatchRow {
     pub raw: String,
 }
 
+/// A match payload that the current parser rejected.
+///
+/// Failed history payloads are kept aside so a parser change can be applied
+/// later without re-fetching from Steam. Ranked matches keep their raw JSON in
+/// [`MatchRow::raw`] instead; unranked payloads are discarded.
+#[derive(Debug, Clone, Serialize, Deserialize, Row)]
+pub struct RawMatchRow {
+    pub match_seq_num: u64,
+    pub match_id: u64,
+    pub start_time: u32,
+    pub fetched_at: u32,
+    pub parse_error: String,
+    pub raw: String,
+}
+
+impl RawMatchRow {
+    pub fn capture(value: &Value, fetched_at: u32, parse_error: String) -> Self {
+        Self {
+            match_seq_num: uint(value, "match_seq_num"),
+            match_id: uint(value, "match_id"),
+            start_time: uint(value, "start_time") as u32,
+            fetched_at,
+            parse_error,
+            raw: value.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Row)]
 pub struct PlayerRow {
     pub match_id: u64,
@@ -604,6 +632,18 @@ mod tests {
         assert_eq!(game.dire_heroes(), vec![6, 7, 8, 9, 10]);
         assert!(game.raw.contains("objectives"));
         assert_eq!(game.player_rows()[0].items, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn captures_raw_payload_for_reparse() {
+        let value = fixture_match(321, true);
+        let raw = RawMatchRow::capture(&value, 1_700_000_000, "boom".into());
+        assert_eq!(raw.match_id, 321);
+        assert_eq!(raw.match_seq_num, 642);
+        assert_eq!(raw.start_time, 1_700_000_000);
+        assert_eq!(raw.parse_error, "boom");
+        assert!(raw.raw.contains("\"match_id\":321"));
+        assert_eq!(serde_json::from_str::<Value>(&raw.raw).unwrap(), value);
     }
 
     #[test]
