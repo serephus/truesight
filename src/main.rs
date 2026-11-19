@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
             if let Err(error) = collector::reparse(&ch, &ct).await {
                 warn!(error = %format!("{error:#}"), "failed to reparse stored raw matches");
             }
+            // The reparse is one-shot; keep the task alive until shutdown so it
+            // is not mistaken for a service task that exited unexpectedly.
+            ct.cancelled().await;
             Ok(())
         });
     }
