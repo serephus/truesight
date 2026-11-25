@@ -12,6 +12,9 @@ const el = {
   meta: $("meta"),
   error: $("error"),
   summary: $("summary"),
+  trendingPeriod: $("trending-period"),
+  trendingNote: $("trending-note"),
+  trendingCards: $("trending-cards"),
   heroRows: $("hero-rows"),
   search: $("search"),
   modal: $("modal"),
@@ -95,6 +98,44 @@ async function loadHeroes() {
   } finally {
     state.loading = false;
   }
+}
+
+async function loadTrending() {
+  const data = await api(`/api/trending?period=${state.period}&limit=5`);
+  renderTrending(data);
+}
+
+function periodLabel() {
+  if (state.period === "week") return "this week";
+  if (state.period === "month") return "this month";
+  return "today";
+}
+
+function renderTrending(data) {
+  el.trendingPeriod.textContent = periodLabel();
+  const windowEnd = data.window_end || data.computed_at;
+  el.trendingNote.textContent = data.window_start && windowEnd
+    ? `${formatTime(data.window_start)} → ${formatTime(windowEnd)}`
+    : "";
+  const heroes = data.heroes || [];
+  if (!heroes.length) {
+    el.trendingCards.innerHTML = `<p class="muted trending-empty">No rising heroes for this period yet.</p>`;
+    return;
+  }
+  el.trendingCards.innerHTML = heroes.map((hero) => {
+    const winRate = Math.max(0, Math.min(1, Number(hero.win_rate || 0)));
+    return `<button class="trend-card" type="button" data-hero="${hero.hero_id}">
+      ${heroIcon(hero.icon, "", hero.icon_url)}
+      <span class="trend-body">
+        <span class="trend-name">${esc(hero.localized_name || `#${hero.hero_id}`)}</span>
+        <span class="trend-sub">${num(hero.rating)} rating · ${(winRate * 100).toFixed(1)}% WR</span>
+      </span>
+      <span class="trend-delta delta-up">+${num(hero.delta)}</span>
+    </button>`;
+  }).join("");
+  el.trendingCards.querySelectorAll("button[data-hero]").forEach((card) => {
+    card.addEventListener("click", () => openHero(Number(card.dataset.hero)));
+  });
 }
 
 function renderMeta(data) {
@@ -264,13 +305,18 @@ function closeModal() {
   target?.focus?.();
 }
 
+function refresh() {
+  loadHeroes().catch(showError);
+  loadTrending().catch(showError);
+}
+
 function setPeriod(period) {
   state.period = period;
   document.querySelectorAll("#periods .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.period === period);
   });
   closeModal();
-  loadHeroes().catch(showError);
+  refresh();
 }
 
 document.querySelectorAll("#periods .tab").forEach((tab) => {
@@ -287,10 +333,10 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeModal();
 });
 
-loadHeroes().catch(showError);
+refresh();
 setInterval(() => {
-  if (!document.hidden) loadHeroes().catch(showError);
+  if (!document.hidden) refresh();
 }, 60_000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) loadHeroes().catch(showError);
+  if (!document.hidden) refresh();
 });

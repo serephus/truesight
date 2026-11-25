@@ -138,6 +138,39 @@ main { padding: 22px clamp(16px, 4vw, 44px) 60px; }
 .summary b { color: var(--text); }
 .page-title { margin: 0 0 12px; font-size: 22px; letter-spacing: -.02em; }
 
+.trending { margin: 0 0 18px; }
+.trending-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.trending-head h2 { margin: 0; font-size: 16px; letter-spacing: -.01em; }
+.trending-head h2 span { color: var(--accent); }
+.trending-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+.trend-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--panel), var(--bg-soft));
+  cursor: pointer;
+  transition: .15s ease;
+}
+.trend-card:hover, .trend-card:focus-visible {
+  border-color: rgba(94, 234, 212, .5);
+  background: rgba(94, 234, 212, .06);
+  outline: none;
+}
+.trend-card .hero-icon { width: 44px; height: 44px; }
+.trend-body { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.trend-name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trend-sub { color: var(--muted); font-size: 12px; }
+.trend-delta { font-weight: 750; font-variant-numeric: tabular-nums; }
+.trending-empty { margin: 0; padding: 12px 0; font-size: 13px; }
+
 .table-wrap {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -241,6 +274,7 @@ h3.section { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; 
 
 @media (max-width: 820px) {
   .search { width: 100%; margin-left: 0; }
+  .trending-cards { grid-template-columns: 1fr 1fr; }
   .counter-grid { grid-template-columns: 1fr; }
   .detail-head { flex-wrap: wrap; }
   .big-rating { margin-left: 0; text-align: left; }
