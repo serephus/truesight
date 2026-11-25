@@ -248,13 +248,19 @@ systemd credentials, and applies systemd hardening. The ClickHouse data lives in
 |---|---|
 | `GET /api/health` | Uptime, checkpoint, stored match count, snapshot times |
 | `GET /api/heroes?period=day\|week\|month` | Latest hero leaderboard |
+| `GET /api/trending?period=day\|week\|month&limit=5` | Top rating risers versus the previous snapshot |
 | `GET /api/heroes/{hero_id}?period=…&min_games=20` | Hero detail, history, counters |
 
 Hero responses include the anchored `window_start` and `window_end` timestamps.
 
+`/api/trending` returns the heroes with the largest positive `delta` (rating
+change versus the previous snapshot) in the newest snapshot for the selected
+period. Heroes are already filtered by `TRUESIGHT_MIN_RATED_GAMES` at fit time.
+`limit` defaults to 5 and is clamped to 50.
+
 The frontend is embedded in the binary (`assets/`), so no Node build step or
 static file deployment is required. The UI is a single leaderboard with search,
-day/week/month switching, and a hero detail modal. Hero objects include `localized_name`,
+day/week/month switching, a trending-risers row, and a hero detail modal. Hero objects include `localized_name`,
 `icon`, `icon_url`, `primary_attr`, `attack_type`, and `roles`, loaded from
 Steam's `IEconDOTA2_570/GetHeroes` endpoint. Hero metadata is refreshed even
 when the match collector is disabled, as long as Steam keys are configured.

@@ -34,6 +34,8 @@ const PAIR_CACHE_TTL: Duration = Duration::from_secs(60);
 const HERO_META_CACHE_TTL: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_TRENDING_LIMIT: usize = 5;
+const MAX_TRENDING_LIMIT: usize = 50;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -73,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/static/style.css", get(style_css))
         .route("/api/health", get(health))
         .route("/api/heroes", get(heroes))
+        .route("/api/trending", get(trending))
         .route("/api/heroes/{hero_id}", get(hero_detail))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -162,6 +165,12 @@ struct PeriodQuery {
 struct HeroQuery {
     period: Option<String>,
     min_games: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TrendingQuery {
+    period: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -394,6 +403,59 @@ async fn heroes(
 }
 
 #[derive(Serialize)]
+struct TrendingResponse {
+    period: &'static str,
+    computed_at: u32,
+    patch: String,
+    window_start: u32,
+    window_end: u32,
+    heroes: Vec<HeroDto>,
+}
+
+async fn trending(
+    State(state): State<AppState>,
+    Query(query): Query<TrendingQuery>,
+) -> Result<Json<TrendingResponse>, ApiError> {
+    let period = parse_period(query.period.as_deref())?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_TRENDING_LIMIT)
+        .clamp(1, MAX_TRENDING_LIMIT);
+    let Some(model) = latest_model(&state.ch, period)
+        .await
+        .map_err(ApiError::internal)?
+    else {
+        return Ok(Json(TrendingResponse {
+            period: period.as_str(),
+            computed_at: 0,
+            patch: String::new(),
+            window_start: 0,
+            window_end: 0,
+            heroes: Vec::new(),
+        }));
+    };
+    let rows = latest_ratings(&state.ch, period, model.computed_at, &model.patch, None)
+        .await
+        .map_err(ApiError::internal)?;
+    let meta = hero_meta(&state).await;
+    let heroes = select_trending(rows, limit)
+        .into_iter()
+        .map(|row| {
+            let hero_id = row.hero_id;
+            hero_dto(row, meta.get(&hero_id))
+        })
+        .collect();
+    Ok(Json(TrendingResponse {
+        period: period.as_str(),
+        computed_at: model.computed_at,
+        patch: model.patch.clone(),
+        window_start: model.window_start,
+        window_end: effective_window_end(&model),
+        heroes,
+    }))
+}
+
+#[derive(Serialize)]
 struct HeroDetailResponse {
     period: &'static str,
     computed_at: u32,
@@ -593,6 +655,20 @@ fn effective_window_end(model: &ModelRow) -> u32 {
     } else {
         model.window_end
     }
+}
+
+/// Picks the heroes with the largest positive rating change versus their
+/// previous snapshot. Ties fall back to the higher current rating so the order
+/// is deterministic.
+fn select_trending(mut rows: Vec<RatingRow>, limit: usize) -> Vec<RatingRow> {
+    rows.retain(|row| row.delta > 0.0 && row.delta.is_finite());
+    rows.sort_by(|a, b| {
+        b.delta
+            .total_cmp(&a.delta)
+            .then_with(|| b.rating.total_cmp(&a.rating))
+    });
+    rows.truncate(limit);
+    rows
 }
 
 async fn latest_ratings(
@@ -855,6 +931,49 @@ mod tests {
         assert!(icon_url("bad\"slug").ends_with("/badslug.png"));
         assert!(!icon_url("bad\"slug").contains('"'));
         assert_eq!(icon_url(""), "");
+    }
+
+    fn rating_row(hero_id: u16, rating: f64, delta: f64) -> RatingRow {
+        RatingRow {
+            hero_id,
+            rating,
+            rating_se: 0.0,
+            games: 100,
+            wins: 50,
+            win_rate: 0.5,
+            prev_rating: rating - delta,
+            delta,
+            rank: 0,
+        }
+    }
+
+    #[test]
+    fn trending_keeps_positive_risers_in_delta_order() {
+        let rows = vec![
+            rating_row(1, 1600.0, 0.0),
+            rating_row(2, 1550.0, 30.0),
+            rating_row(3, 1500.0, 50.0),
+            rating_row(4, 1500.0, -10.0),
+            rating_row(5, 1500.0, f64::NAN),
+            rating_row(6, 1510.0, 50.0),
+        ];
+        let ids: Vec<u16> = select_trending(rows, 10)
+            .into_iter()
+            .map(|row| row.hero_id)
+            .collect();
+        assert_eq!(ids, vec![6, 3, 2]);
+    }
+
+    #[test]
+    fn trending_truncates_to_the_limit() {
+        let rows = vec![rating_row(1, 1500.0, 10.0), rating_row(2, 1500.0, 20.0)];
+        assert_eq!(select_trending(rows, 1).len(), 1);
+    }
+
+    #[test]
+    fn trending_is_empty_without_risers() {
+        let rows = vec![rating_row(1, 1500.0, 0.0), rating_row(2, 1500.0, -5.0)];
+        assert!(select_trending(rows, 5).is_empty());
     }
 
     #[test]
